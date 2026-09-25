@@ -1,0 +1,23 @@
+{
+  "name": "orbital",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Orbital — AI-driven desktop IDE. Root orchestration: Tauri host, task scripts and the frontend workspace.",
+  "workspaces": [
+    "frontend"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace frontend",
+    "build": "npm run build --workspace frontend",
+    "preview": "npm run preview --workspace frontend",
+    "typecheck": "npm run typecheck --workspace frontend",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "backend:dev": "node backend/dev.mjs",
+    "backend:build": "python backend/build_sidecar.py"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.2.0"
+  }
+}

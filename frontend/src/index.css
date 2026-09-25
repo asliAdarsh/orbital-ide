@@ -1,0 +1,139 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Orbital is dark-only by design: a high-contrast UTC/industrial IDE surface.
+ * Graphite chrome, near-black canvas, and a chartreuse signature accent that
+ * reads instantly against the muted structural greys.
+ */
+@layer base {
+  :root {
+    --background: 220 16% 4%;
+    --foreground: 210 22% 93%;
+
+    --chrome: 220 14% 7%;
+    --chrome-raised: 220 13% 10%;
+    --chrome-sunken: 220 16% 3%;
+
+    --card: 220 14% 7%;
+    --card-foreground: 210 22% 93%;
+    --popover: 220 14% 8%;
+    --popover-foreground: 210 22% 93%;
+
+    --primary: 74 92% 60%;
+    --primary-foreground: 220 45% 6%;
+
+    --secondary: 220 12% 14%;
+    --secondary-foreground: 210 20% 90%;
+
+    --muted: 220 12% 13%;
+    --muted-foreground: 219 11% 58%;
+
+    --accent: 190 90% 55%;
+    --accent-foreground: 220 45% 6%;
+
+    --destructive: 0 74% 60%;
+    --destructive-foreground: 220 45% 6%;
+
+    --border: 220 12% 16%;
+    --input: 220 12% 14%;
+    --ring: 74 92% 60%;
+
+    /* Pipeline phase identity colours. */
+    --phase-plan: 265 85% 70%;
+    --phase-design: 190 90% 58%;
+    --phase-build: 74 92% 60%;
+    --phase-test: 38 95% 58%;
+    --phase-sync: 320 85% 66%;
+
+    --radius: 0.5rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    overflow: hidden;
+    font-feature-settings: "cv05" 1, "ss01" 1;
+  }
+
+  /* Thin, chrome-coloured scrollbars — panes are dense, default bars are noise. */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 8px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(220 10% 28%);
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  ::selection {
+    background: hsl(var(--primary) / 0.28);
+  }
+
+  /* Focus rings must never be invisible on the graphite surfaces. */
+  :focus-visible {
+    @apply outline-none ring-1 ring-ring;
+  }
+}
+
+@layer components {
+  /* Dense panel header used by the terminal, inspector, and file tree. */
+  .pane-label {
+    @apply flex h-8 shrink-0 select-none items-center gap-2 border-b border-border px-3
+           text-2xs font-medium uppercase tracking-[0.14em] text-muted-foreground;
+  }
+
+  /* Monospaced key/value row for the execution inspector. */
+  .kv-row {
+    @apply flex items-baseline justify-between gap-3 py-1 text-xs;
+  }
+
+  /* Diagonal hatch used behind empty states so the shell never looks broken. */
+  .hatch {
+    background-image: repeating-linear-gradient(
+      45deg,
+      hsl(var(--border) / 0.55) 0px,
+      hsl(var(--border) / 0.55) 1px,
+      transparent 1px,
+      transparent 7px
+    );
+  }
+
+  .scrollbar-none {
+    scrollbar-width: none;
+  }
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* xterm.js overrides: the terminal must sit flush inside the bottom panel. */
+.xterm .xterm-viewport {
+  background-color: transparent !important;
+  scrollbar-width: thin;
+}
+.xterm-screen {
+  padding: 0;
+}

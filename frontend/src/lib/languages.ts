@@ -1,0 +1,91 @@
+/** File extension → Monaco language id. Mirrors the backend's mapping in routes/project.py. */
+
+const LANGUAGES: Record<string, string> = {
+  ".ts": "typescript",
+  ".tsx": "typescript",
+  ".mts": "typescript",
+  ".cts": "typescript",
+  ".js": "javascript",
+  ".jsx": "javascript",
+  ".mjs": "javascript",
+  ".cjs": "javascript",
+  ".json": "json",
+  ".jsonc": "json",
+  ".md": "markdown",
+  ".markdown": "markdown",
+  ".mdx": "markdown",
+  ".css": "css",
+  ".scss": "scss",
+  ".less": "less",
+  ".html": "html",
+  ".htm": "html",
+  ".vue": "html",
+  ".svelte": "html",
+  ".py": "python",
+  ".pyi": "python",
+  ".rs": "rust",
+  ".go": "go",
+  ".java": "java",
+  ".kt": "kotlin",
+  ".swift": "swift",
+  ".rb": "ruby",
+  ".php": "php",
+  ".cs": "csharp",
+  ".c": "c",
+  ".h": "c",
+  ".cpp": "cpp",
+  ".cc": "cpp",
+  ".hpp": "cpp",
+  ".m": "objective-c",
+  ".sh": "shell",
+  ".bash": "shell",
+  ".zsh": "shell",
+  ".ps1": "powershell",
+  ".bat": "bat",
+  ".cmd": "bat",
+  ".yml": "yaml",
+  ".yaml": "yaml",
+  ".toml": "ini",
+  ".ini": "ini",
+  ".cfg": "ini",
+  ".env": "ini",
+  ".sql": "sql",
+  ".graphql": "graphql",
+  ".gql": "graphql",
+  ".xml": "xml",
+  ".svg": "xml",
+  ".dockerfile": "dockerfile",
+  ".tf": "hcl",
+  ".lua": "lua",
+  ".r": "r",
+  ".dart": "dart",
+  ".ex": "elixir",
+  ".exs": "elixir",
+  ".clj": "clojure",
+  ".scala": "scala",
+  ".pl": "perl",
+  ".proto": "protobuf",
+};
+
+const FILENAMES: Record<string, string> = {
+  dockerfile: "dockerfile",
+  makefile: "makefile",
+  "cmakelists.txt": "cmake",
+  "cargo.lock": "toml",
+  "package-lock.json": "json",
+  "pnpm-lock.yaml": "yaml",
+  "tsconfig.json": "json",
+  ".gitignore": "plaintext",
+  ".env": "ini",
+  ".editorconfig": "ini",
+};
+
+/** Monaco language id for a workspace path, defaulting to plain text. */
+export function languageFor(path: string): string {
+  const name = path.split("/").pop()?.toLowerCase() ?? "";
+  const byName = FILENAMES[name];
+  if (byName) return byName;
+  const dot = name.lastIndexOf(".");
+  if (dot <= 0) return "plaintext";
+  return LANGUAGES[name.slice(dot)] ?? "plaintext";
+}

@@ -1,0 +1,35 @@
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.local
+
+# Python sidecar
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+*.spec.bak
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+# PyInstaller output for the bundled sidecar
+src-tauri/binaries/
+
+# Scratch directory some dev tools use inside the checkout
+.orbital/
+*.log
+
+# Secrets. The template stays tracked; every real env file is ignored.
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Editors
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store

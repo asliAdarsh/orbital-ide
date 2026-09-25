@@ -1,0 +1,27 @@
+# Orbital backend runtime — pinned to the versions this build was verified against.
+# Install:  python -m venv .venv && .venv/Scripts/pip install -r backend/requirements.txt
+
+# --- HTTP / WebSocket transport ---------------------------------------------------
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+websockets==16.1.1
+httpx==0.28.1
+
+# --- Agent orchestration ----------------------------------------------------------
+langgraph==1.2.11
+langchain==1.4.0
+langchain-core==1.6.2
+langchain-openai==1.6.2
+
+# --- Configuration & validation ---------------------------------------------------
+pydantic==2.13.5
+pydantic-settings==2.15.0
+
+# --- Workspace watching -----------------------------------------------------------
+# chokidar is a Node library and cannot run inside the Python sidecar; watchfiles is the
+# equivalent production watcher (the same one uvicorn --reload uses).
+watchfiles==1.2.0
+
+# --- Tests -----------------------------------------------------------------------
+pytest==9.1.1
+pytest-asyncio==1.4.0
