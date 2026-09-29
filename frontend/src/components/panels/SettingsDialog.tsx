@@ -15,10 +15,10 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
-import { ConfirmButton } from "@/components/common/ConfirmButton";
 import { SectionLabel } from "@/components/common/SectionLabel";
 import { StatusDot } from "@/components/common/StatusDot";
 import { toast } from "@/components/common/Toaster";
+import { ProvidersPanel } from "@/components/settings/ProvidersPanel";
 
 /** Panel dimensions the user may have dragged; clearing them restores the defaults. */
 const PANEL_SIZE_KEYS = [
@@ -27,23 +27,30 @@ const PANEL_SIZE_KEYS = [
   "orbital.bottomPanelHeight",
 ] as const;
 
-/** The editable slice of the config, as typed into the form: every field present. */
-type Draft = Required<ConfigUpdate>;
+/**
+ * The editable slice of the config, as typed into the form: every field present.
+ *
+ * The model, the endpoint and the key are deliberately absent. They belong to a provider profile
+ * now, and a second way to set them here would be a way to set the one a run does not use.
+ */
+type Draft = Omit<Required<ConfigUpdate>, "model" | "baseUrl" | "apiKey">;
 
 const LABEL = "text-2xs text-muted-foreground";
 const FIELD = "h-7 font-mono text-2xs";
 
 /**
- * The credential row's wording. A key can be present and still refused by the gateway, which is
- * the state a presence check cannot see and the one worth showing here — this page is where the
- * key is replaced.
+ * The credential row's wording, from the last authenticated call the runtime made.
+ *
+ * `llmConfigured` is deliberately not consulted: it describes the `ORBITAL_LLM_*` values in
+ * `.env`, and a provider profile overrides those — so it can read "not configured" while a run
+ * works, and "configured" while nothing does. `llmCredential` is only ever set by a real call, so
+ * it is the one field that still answers whether the key a run would use is accepted.
  */
 function credentialStatus(health: HealthResponse | null): { label: string; warn: boolean } {
   if (health === null) return { label: "—", warn: false };
-  if (!health.llmConfigured) return { label: "not configured", warn: true };
   if (health.llmCredential === "rejected") return { label: "rejected by the gateway", warn: true };
   if (health.llmCredential === "ok") return { label: "accepted by the gateway", warn: false };
-  return { label: "configured, not verified yet", warn: false };
+  return { label: "not verified yet", warn: false };
 }
 
 function formatUptime(seconds: number): string {
@@ -66,7 +73,7 @@ export function SettingsDialog() {
   const [draft, setDraft] = useState<Draft | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [pending, setPending] = useState<"save" | "clear" | null>(null);
+  const [saving, setSaving] = useState(false);
   const [reloadNonce, setReloadNonce] = useState(0);
 
   // Everything is read fresh each time the page opens: the backend config can change
@@ -82,9 +89,6 @@ export function SettingsDialog() {
         setConfig(nextConfig);
         setHealth(nextHealth);
         setDraft({
-          model: nextConfig.model,
-          baseUrl: nextConfig.baseUrl,
-          apiKey: "",
           commandTimeout: nextConfig.commandTimeout,
           maxOutputBytes: nextConfig.maxOutputBytes,
           contextWindow: nextConfig.contextWindow,
@@ -109,51 +113,30 @@ export function SettingsDialog() {
   const handleSave = async () => {
     if (config === null || draft === null) return;
     const patch: ConfigUpdate = {};
-    if (draft.model !== config.model) patch.model = draft.model;
-    if (draft.baseUrl !== config.baseUrl) patch.baseUrl = draft.baseUrl;
     if (draft.contextWindow !== config.contextWindow) patch.contextWindow = draft.contextWindow;
     if (draft.maxTokens !== config.maxTokens) patch.maxTokens = draft.maxTokens;
     if (draft.commandTimeout !== config.commandTimeout) patch.commandTimeout = draft.commandTimeout;
     if (draft.maxOutputBytes !== config.maxOutputBytes) patch.maxOutputBytes = draft.maxOutputBytes;
     const roots = draft.allowedRoots.map((root) => root.trim()).filter((root) => root !== "");
     if (roots.join("\n") !== config.allowedRoots.join("\n")) patch.allowedRoots = roots;
-    // A blank key field means "leave the stored credential alone"; clearing is explicit.
-    if (draft.apiKey !== "") patch.apiKey = draft.apiKey;
 
     if (Object.keys(patch).length === 0) {
       toast.info("Nothing to save.");
       return;
     }
 
-    setPending("save");
+    setSaving(true);
     try {
       const result = await api.updateConfig(patch);
       setConfig(await api.config());
-      setDraft({ ...draft, apiKey: "", allowedRoots: roots });
+      setDraft({ ...draft, allowedRoots: roots });
       toast.success(
         result.changed.length > 0 ? `Updated ${result.changed.join(", ")}` : "Configuration unchanged.",
       );
     } catch (err: unknown) {
       toast.error(errorMessage(err));
     } finally {
-      setPending(null);
-    }
-  };
-
-  const handleClearKey = async () => {
-    if (draft === null) return;
-    setPending("clear");
-    try {
-      const result = await api.updateConfig({ apiKey: "" });
-      setConfig(await api.config());
-      setDraft({ ...draft, apiKey: "" });
-      toast.success(
-        result.changed.length > 0 ? `Updated ${result.changed.join(", ")}` : "Stored key was already clear.",
-      );
-    } catch (err: unknown) {
-      toast.error(errorMessage(err));
-    } finally {
-      setPending(null);
+      setSaving(false);
     }
   };
 
@@ -168,7 +151,6 @@ export function SettingsDialog() {
     window.location.reload();
   };
 
-  const keyConfigured = config?.apiKeyConfigured ?? false;
   const credential = credentialStatus(health);
 
   return (
@@ -182,6 +164,10 @@ export function SettingsDialog() {
           </DialogDescription>
         </DialogHeader>
 
+        <ProvidersPanel />
+
+        <Separator />
+
         {loading ? (
           <p className="py-8 text-center text-2xs text-muted-foreground">Loading configuration…</p>
         ) : loadError !== null ? (
@@ -194,27 +180,7 @@ export function SettingsDialog() {
         ) : config !== null && draft !== null ? (
           <>
             <div className="flex flex-col gap-2">
-              <SectionLabel className="-mx-2">Model &amp; endpoint</SectionLabel>
-
-              <label className="grid grid-cols-[10rem_1fr] items-center gap-3">
-                <span className={LABEL}>Model</span>
-                <Input
-                  className={FIELD}
-                  placeholder="gateway default"
-                  value={draft.model}
-                  onChange={(event) => setDraft({ ...draft, model: event.target.value })}
-                />
-              </label>
-
-              <label className="grid grid-cols-[10rem_1fr] items-center gap-3">
-                <span className={LABEL}>Base URL</span>
-                <Input
-                  className={FIELD}
-                  placeholder="http://127.0.0.1:1234/v1"
-                  value={draft.baseUrl}
-                  onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })}
-                />
-              </label>
+              <SectionLabel className="-mx-2">Model limits</SectionLabel>
 
               <label className="grid grid-cols-[10rem_1fr] items-center gap-3">
                 <span className={LABEL}>Context window</span>
@@ -243,34 +209,6 @@ export function SettingsDialog() {
                   }
                 />
               </label>
-
-              <div className="grid grid-cols-[10rem_1fr] items-start gap-3">
-                <span className={cn(LABEL, "pt-1")}>API key</span>
-                <div className="flex flex-col gap-1.5">
-                  <div className="flex items-center gap-1.5">
-                    <StatusDot state={keyConfigured ? "online" : "offline"} />
-                    <span className={cn(LABEL, keyConfigured ? null : "text-phase-test")}>
-                      {keyConfigured ? "stored" : "not set"}
-                    </span>
-                    <ConfirmButton
-                      className="ml-auto"
-                      confirmLabel="Confirm clear"
-                      disabled={!keyConfigured || pending !== null}
-                      onConfirm={() => void handleClearKey()}
-                    >
-                      Clear key
-                    </ConfirmButton>
-                  </div>
-                  <Input
-                    type="password"
-                    autoComplete="off"
-                    className={FIELD}
-                    placeholder="leave blank to keep the stored key"
-                    value={draft.apiKey}
-                    onChange={(event) => setDraft({ ...draft, apiKey: event.target.value })}
-                  />
-                </div>
-              </div>
             </div>
 
             <Separator />
@@ -361,9 +299,6 @@ export function SettingsDialog() {
                 <span className={LABEL}>Protocol</span>
                 <span className="text-foreground">{health ? `v${health.protocolVersion}` : "—"}</span>
 
-                <span className={LABEL}>Model</span>
-                <span className="truncate text-foreground">{health?.model || "—"}</span>
-
                 <span className={LABEL}>LLM credential</span>
                 <span
                   className={cn(credential.warn ? "text-phase-test" : "text-foreground")}
@@ -406,16 +341,13 @@ export function SettingsDialog() {
         ) : null}
 
         <DialogFooter>
-          <span className="mr-auto text-2xs text-muted-foreground">
-            Endpoint or port changes may need a backend restart.
-          </span>
           <Button variant="secondary" size="sm" onClick={() => setSettingsOpen(false)}>
             Cancel
           </Button>
           <Button
             size="sm"
-            loading={pending === "save"}
-            disabled={config === null || draft === null || pending !== null || loading}
+            loading={saving}
+            disabled={config === null || draft === null || saving || loading}
             onClick={() => void handleSave()}
           >
             Save

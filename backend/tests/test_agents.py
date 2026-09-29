@@ -702,13 +702,39 @@ def test_describe_failure_reads_a_json_error_envelope() -> None:
     assert "missing x-opencode-session" in message
 
 
-def test_describe_failure_points_at_the_key_when_rejected() -> None:
+def test_describe_failure_lets_a_provider_that_explains_itself_speak_alone() -> None:
+    """Vercel answers 403 with "a valid credit card is required", and appending "the endpoint
+    refused the key — check its permissions" to that states a second cause that is simply wrong:
+    it sends the user to inspect a key that was never the problem."""
     message = describe_failure(
-        _FakeStatusError(401, '{"type":"error","error":{"type":"AuthError","message":"Invalid API key."}}')
+        _FakeStatusError(
+            403,
+            '{"error": {"message": "AI Gateway requires a valid credit card on file to service '
+            'requests.", "type": "customer_verification_required"}}',
+            "https://ai-gateway.vercel.sh/v1/chat/completions",
+        )
     )
 
-    assert "Invalid API key." in message
+    assert "HTTP 403" in message
+    assert "valid credit card on file" in message
+    assert "https://ai-gateway.vercel.sh/v1/chat/completions" in message
+    assert "ORBITAL_LLM_API_KEY" not in message
+    assert "refused the key" not in message, "the hint would contradict the provider's own reason"
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("body", ["", "   ", "<html><body></body></html>"])
+def test_describe_failure_keeps_the_hint_when_there_is_nothing_to_quote(
+    status: int, body: str
+) -> None:
+    """With no words from the endpoint the hint is all the user gets, so it has to be there."""
+    message = describe_failure(
+        _FakeStatusError(status, body, "https://opencode.ai/zen/v1/chat/completions")
+    )
+
+    assert f"HTTP {status}" in message
     assert "ORBITAL_LLM_API_KEY" in message
+    assert "https://opencode.ai/zen/v1/chat/completions" in message
 
 
 def test_describe_failure_caps_a_plain_exception() -> None:
@@ -749,7 +775,7 @@ def test_is_credential_failure_separates_a_refusal_from_an_outage() -> None:
 def test_a_refused_key_is_reported_as_one_line_and_remembered(
     monkeypatch: pytest.MonkeyPatch, configured_llm: None
 ) -> None:
-    """The user reads a remedy rather than a provider traceback, and the verdict survives."""
+    """The user reads what the endpoint said rather than a provider traceback, and it survives."""
     from orbital_backend.agents.llm import credential_status
     from orbital_backend.agents.runner import _report_unexpected
 
@@ -760,10 +786,31 @@ def test_a_refused_key_is_reported_as_one_line_and_remembered(
     state, stored = credential_status()
 
     assert "Invalid API key." in detail
-    assert "Settings" in detail
+    assert "ORBITAL_LLM_API_KEY" not in detail, (
+        "the endpoint named its own reason, so the status hint is not stacked on top of it"
+    )
     assert state == "rejected"
     assert "Invalid API key." in (stored or "")
-    assert "Settings" not in (stored or ""), "the stored reason must not repeat the remedy"
+    assert "ORBITAL_LLM_API_KEY" not in (stored or ""), "the stored reason must not repeat a remedy"
+
+
+def test_a_refusal_the_provider_did_not_explain_is_given_the_remedy(
+    monkeypatch: pytest.MonkeyPatch, configured_llm: None
+) -> None:
+    """With no words from the endpoint the hint is the only thing the user has to act on — and it
+    stays out of what is *stored*, which the message that reports it already carries."""
+    from orbital_backend.agents.llm import credential_status
+    from orbital_backend.agents.runner import _report_unexpected
+
+    _reset_credential(monkeypatch)
+    exc = _FakeStatusError(401, "")
+
+    detail = _report_unexpected(exc, "discussion turn failed")
+    state, stored = credential_status()
+
+    assert "ORBITAL_LLM_API_KEY" in detail
+    assert state == "rejected"
+    assert "ORBITAL_LLM_API_KEY" not in (stored or ""), "the stored reason must not repeat the remedy"
 
 
 def test_a_refused_key_is_never_refused_locally(

@@ -1,0 +1,26 @@
+{
+  "name": "orbital-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The Orbital gateway: an OpenAI-compatible endpoint that runs a signed-in user's phases on the Orbital key, so no key ever ships in the desktop app.",
+  "main": "dist/index.js",
+  "engines": {
+    "node": "20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
+    "test": "node --import tsx --test --test-concurrency=1 test/gateway.test.ts test/credits.test.ts test/rules.test.ts test/projectSync.rules.test.ts test/accounting.test.ts"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "firebase-admin": "^13.0.2",
+    "firebase-functions": "^6.1.1"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.17.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

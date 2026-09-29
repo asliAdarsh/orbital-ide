@@ -10,6 +10,8 @@ const stateClass: Record<StatusDotState, string> = {
   cancelled: "bg-muted-foreground/50",
   offline: "bg-muted-foreground/50",
   running: "bg-primary animate-rail-pulse",
+  // Held at a step boundary, not stopped: amber, and deliberately not pulsing.
+  paused: "bg-phase-test",
   online: "bg-primary",
   done: "bg-primary/70",
   error: "bg-destructive",

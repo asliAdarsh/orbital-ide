@@ -3,14 +3,14 @@ import { ChevronDown, ChevronRight, File, Folder, Paperclip, X } from "lucide-re
 
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { cn } from "@/lib/utils";
+import { baseName, cn } from "@/lib/utils";
 import type { FileNode } from "@/types/protocol";
 
 /**
- * The backend refuses a message carrying more than this many attachments, so the popover stops the
+ * The backend refuses a message carrying more than this many attachments, so the picker stops the
  * user here rather than letting a run fail on a limit they cannot see. Mirrors the backend cap.
  */
-const MAX_ATTACHMENTS = 12;
+export const MAX_ATTACHMENTS = 12;
 /** Indent per tree level, in pixels — deeper than this and a path name has no room left. */
 const INDENT_PX = 10;
 
@@ -23,18 +23,12 @@ export interface ComposerAttachmentsProps {
   onDetach(path: string): void;
 }
 
-/** Last path segment: a chip has room for the name, and the tooltip carries the whole path. */
-function fileName(path: string): string {
-  const segments = path.split("/");
-  return segments[segments.length - 1] || path;
-}
-
 /**
- * The attach button, its workspace-tree popover, and the removable chips for what was picked.
+ * The attach button and its workspace-tree popover.
  *
- * The trigger and the chips are returned as siblings rather than wrapped in a container: the
- * composer's action row is what wraps, so a long list of picks flows onto more lines instead of
- * squeezing the buttons beside it. Popover and chips are therefore styled for that row.
+ * Only the trigger: the chips are {@link AttachmentChips}, rendered by the composer directly above
+ * the textarea, because a pick has to sit where the caret is rather than in the toolbar — the
+ * backspace that removes one only reads as "backspace at the chip" if the chip is next to the caret.
  */
 export function ComposerAttachments({
   tree,
@@ -103,48 +97,66 @@ export function ComposerAttachments({
   };
 
   return (
-    <>
-      <Popover>
-        <PopoverTrigger asChild>
-          <Button
-            size="icon"
-            variant="outline"
-            className={cn("size-6", selected.length > 0 && "text-primary")}
-            aria-label="Attach workspace files"
-            title="Attach workspace files or folders"
-          >
-            <Paperclip className="size-3.5" />
-          </Button>
-        </PopoverTrigger>
-        <PopoverContent align="start" className="w-64 p-0">
-          {tree === null ? (
-            <p className="p-2 text-muted-foreground">
-              Open a folder first — attachments are read from the workspace.
+    <Popover>
+      <PopoverTrigger asChild>
+        <Button
+          size="icon"
+          variant="outline"
+          className={cn("size-6", selected.length > 0 && "text-primary")}
+          aria-label="Attach workspace files"
+          title="Attach workspace files or folders"
+        >
+          <Paperclip className="size-3.5" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-64 p-0">
+        {tree === null ? (
+          <p className="p-2 text-muted-foreground">
+            Open a folder first — attachments are read from the workspace.
+          </p>
+        ) : entries.length === 0 ? (
+          <p className="p-2 text-muted-foreground">This folder has nothing to attach.</p>
+        ) : (
+          <>
+            <div className="max-h-56 overflow-y-auto p-1">{entries.map((node) => renderNode(node, 0))}</div>
+            {/*
+              The one place the run/chat difference is worth saying out loud: a chat turn can
+              carry an image the model actually looks at, a phase run only names it.
+            */}
+            <p className="border-t border-border px-2 py-1 text-muted-foreground">
+              {selected.length}/{MAX_ATTACHMENTS} picked. Chat turns send what you pick; a build
+              run gets text only — images are named, not looked at.
             </p>
-          ) : entries.length === 0 ? (
-            <p className="p-2 text-muted-foreground">This folder has nothing to attach.</p>
-          ) : (
-            <>
-              <div className="max-h-56 overflow-y-auto p-1">{entries.map((node) => renderNode(node, 0))}</div>
-              {/*
-                The one place the run/chat difference is worth saying out loud: a chat turn can
-                carry an image the model actually looks at, a phase run only names it.
-              */}
-              <p className="border-t border-border px-2 py-1 text-muted-foreground">
-                {selected.length}/{MAX_ATTACHMENTS} picked. Chat turns send what you pick; a build
-                run gets text only — images are named, not looked at.
-              </p>
-            </>
-          )}
-        </PopoverContent>
-      </Popover>
+          </>
+        )}
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+export interface AttachmentChipsProps {
+  /** Workspace-relative paths already picked, in the order they were picked. */
+  selected: string[];
+  onDetach(path: string): void;
+}
+
+/**
+ * The picks, as removable chips directly above the textarea.
+ *
+ * A chip is the only place a pick is visible: the frame carries the paths, so what is on screen has
+ * to be exactly what will be sent.
+ */
+export function AttachmentChips({ selected, onDetach }: AttachmentChipsProps) {
+  if (selected.length === 0) return null;
+  return (
+    <div className="mb-1 flex flex-wrap items-center gap-1">
       {selected.map((path) => (
         <span
           key={path}
           className="flex h-6 min-w-0 max-w-40 items-center gap-1 rounded border border-border bg-chrome-raised px-1.5 text-2xs text-foreground"
         >
           <span className="min-w-0 truncate" title={path}>
-            {fileName(path)}
+            {baseName(path)}
           </span>
           <button
             type="button"
@@ -157,6 +169,6 @@ export function ComposerAttachments({
           </button>
         </span>
       ))}
-    </>
+    </div>
   );
 }

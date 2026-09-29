@@ -18,13 +18,15 @@ import {
   type AgentId,
   type CapabilityId,
   type CapabilityInfo,
+  type Chat,
+  type ChatRunStatus,
   type ChatMessage,
   type CommandRequest,
   type CommandResult,
+  type CreateChatRequest,
   type FileContent,
   type FileNode,
   type HealthResponse,
-  type ModelInfo,
   type PermissionMode,
   type Phase,
   type PhaseStatus,
@@ -32,6 +34,7 @@ import {
   type ProjectPatch,
   type ProjectResponse,
   type ReasoningEffort,
+  type RunStatus,
   type ServerMessage,
   type SessionState,
   type TodoItem,
@@ -47,12 +50,15 @@ const TOOL_HISTORY_LIMIT = 60;
 const LOG_LIMIT = 400;
 const AUTO_ADVANCE_KEY = "orbital.autoAdvance";
 const MODEL_KEY = "orbital.model";
+const PROVIDER_KEY = "orbital.provider";
 const REASONING_KEY = "orbital.reasoningEffort";
 const PANELS_KEY = "orbital.panels";
 const PERMISSION_KEY = "orbital.permission";
 const CAPABILITIES_KEY = "orbital.capabilities";
 /** Approval cards kept so a decided one stays visible long enough to read. */
 const APPROVAL_HISTORY_LIMIT = 20;
+/** Side answers kept on screen; they are answers to a moment, not a record to scroll. */
+const SIDE_ANSWER_LIMIT = 6;
 
 let terminalCounter = 0;
 
@@ -68,6 +74,27 @@ function createTerminalTab(cwd: string): TerminalTab {
 
 /** Which of the three panels are shown. */
 export type PanelName = "left" | "right" | "bottom";
+
+/** The sessions panel's two scopes: the folder that is open, or every chat the account has. */
+export type ChatScope = "workspace" | "all";
+
+/**
+ * A side question's answer, held apart from the transcript on purpose.
+ *
+ * `/ask` is about the turn in flight, not a message to the agent — the runtime answers it without
+ * touching the session's history — so it must not become a chat message. Keeping it in its own list
+ * is what makes that structural rather than a rendering choice.
+ */
+export interface SideAnswer {
+  requestId: string;
+  question: string;
+  content: string;
+  /** True while tokens are still arriving. */
+  streaming: boolean;
+  /** Why the answer failed or was cancelled; null while it is fine. */
+  error: string | null;
+  createdAt: number;
+}
 
 export interface PanelVisibility {
   left: boolean;
@@ -167,6 +194,17 @@ function writeStored(key: string, value: string): void {
   } catch {
     // Storage can be unavailable (private mode).
   }
+}
+
+/**
+ * The storage key for a composer pin.
+ *
+ * The pin travels with the account, not the machine: the runtime's session identity is the uid, so
+ * a provider chosen while signed in as one person must not become the endpoint the next person's
+ * runs spend. The uid is unknown until `useAuth` settles, hence `bindAccount`.
+ */
+function pinKey(base: string, uid: string | null): string {
+  return uid === null ? base : `${base}.${uid}`;
 }
 
 function readStoredPanels(): PanelVisibility {
@@ -292,12 +330,24 @@ export interface AppState {
   /** Model id every run uses unless overridden. Empty = whatever the backend is configured with. */
   model: string;
   /**
+   * The provider profile every run is pinned to. Empty means the active profile, which is what a
+   * user who has never switched is on — so the pin is an explicit choice, not a default.
+   *
+   * It travels with each run rather than moving the active badge: naming a provider in the composer
+   * is a decision about this message, and a run that silently re-pointed every other session would
+   * make the badge a lie.
+   */
+  providerId: string;
+  /**
+   * The account whose composer pins are loaded, or null before sign-in. Both pins are stored per
+   * uid, so this is what decides which pair is written back.
+   */
+  accountUid: string | null;
+  /**
    * Reasoning effort sent with each message. Empty = the parameter is left off the frame, because
    * a gateway that does not know `reasoning_effort` rejects the whole request.
    */
   reasoningEffort: ReasoningEffort | "";
-  /** Models the gateway offers, for the composer's picker. */
-  models: ModelInfo[];
   /** Which side the composer is on. The capability defaults and the frame both key off it. */
   composerMode: ComposerMode;
   /** The catalogue from `GET /api/capabilities`; empty until it has loaded. */
@@ -327,6 +377,21 @@ export interface AppState {
   attachments: string[];
   /** What this session has consumed so far, as last reported by the backend. */
   usage: UsageSnapshot;
+
+  /** The saved chats, newest first, as last read from the server. */
+  chats: Chat[];
+  chatsLoading: boolean;
+  chatsError: string | null;
+  /** Which list the sessions panel asks for: this folder's chats, or every one. */
+  chatScope: ChatScope;
+  /**
+   * The chat this window is on, and therefore the session id every frame carries. Null until one is
+   * chosen; a signed-out window sends its local id instead, which is the backend's cue to create the
+   * chat.
+   */
+  activeChatId: string | null;
+  /** Answers to `/ask`, newest first. Never part of `messages` — see {@link SideAnswer}. */
+  sideAnswers: SideAnswer[];
   /** Which of the three panels are expanded. Toggled from the nav. */
   panels: PanelVisibility;
   /** True while the settings page is open over the centre. */
@@ -337,6 +402,8 @@ export interface AppState {
   toolResults: Record<string, ToolResult>;
   activeAgent: AgentId | null;
   running: boolean;
+  /** True while the run is held at a step boundary; `running` stays true, since it is still live. */
+  paused: boolean;
   runError: string | null;
 
   openFiles: OpenFile[];
@@ -374,9 +441,18 @@ export interface AppState {
   setActivePhase(phase: Phase): void;
   setAutoAdvance(enabled: boolean): void;
   setModel(model: string): void;
+  /** Pin the next runs to one provider profile; `""` returns them to the active one. */
+  setProviderId(id: string): void;
+  /**
+   * Load the composer pins belonging to the account that just signed in, and remember whose they
+   * are. Called once per uid by `App`, which is the only place that knows when the account changes.
+   *
+   * `null` clears both: a signed-out window has no account for a pin to belong to, and leaving the
+   * previous one's provider in state would offer it to whoever signs in next.
+   */
+  bindAccount(uid: string | null): void;
   /** Persisted like the model preference; `""` means the parameter is never sent. */
   setReasoningEffort(effort: ReasoningEffort | ""): void;
-  setModels(models: ModelInfo[]): void;
   /** Fetch the capability catalogue once and cache it in the store; failures land in state. */
   loadCapabilities(): void;
   /**
@@ -400,6 +476,35 @@ export interface AppState {
   togglePanel(panel: PanelName): void;
   setSettingsOpen(open: boolean): void;
   setArtifact(name: string, content: string): void;
+  /**
+   * Reload the chat list for the current scope. `quiet` leaves the loading flag alone, for the
+   * refreshes that follow a run — those must not blank a list the user is reading.
+   */
+  loadChats(opts?: { quiet?: boolean }): Promise<void>;
+  setChatScope(scope: ChatScope): void;
+  /**
+   * Adopt a chat as this window's session: every frame from now on carries its id. The socket is
+   * re-subscribed separately ({@link AgentSocketApi.openChat}), which is also what reads the
+   * runtime state back.
+   */
+  setActiveChatId(id: string | null): void;
+  /** Replace the row for a chat the server just answered about, or prepend it when it is new. */
+  mergeChat(chat: Chat): void;
+  /** Replace the whole list, as the create/delete endpoints answer with one. */
+  setChats(chats: Chat[]): void;
+  /** Create a chat and put it at the top of the list. The caller adopts it. */
+  createChat(input?: CreateChatRequest): Promise<Chat | null>;
+  /** Rename in place; the row only changes once the server has accepted the name. */
+  renameChat(id: string, title: string): Promise<void>;
+  /** Empty a chat's transcript, keeping the chat. Applies the runtime state when it is the active one. */
+  clearChat(id: string): Promise<void>;
+  /** Re-read one chat from the server — the row's metadata, and the state behind it. */
+  refreshChat(id: string): Promise<void>;
+  /** Forget a chat. A deleted chat can never be this window's session afterwards. */
+  deleteChat(id: string): Promise<void>;
+  /** Record a side question so its answer has somewhere to stream into. */
+  startSideAnswer(requestId: string, question: string): void;
+  dismissSideAnswer(requestId: string): void;
   applySession(state: SessionState): void;
   applyEvent(message: ServerMessage): void;
   openFile(file: FileContent): void;
@@ -422,6 +527,19 @@ export interface AppState {
   noteApprovalDecision(requestId: string, approved: boolean): void;
   pushLog(level: LogLevel, message: string): void;
   resetRun(): void;
+  /**
+   * Wipe what the agent socket put in the store, for a session that is not this window's any more.
+   *
+   * Called when the account behind the socket changes — a sign-out or an account switch — so no
+   * frame from the previous account can render for the next one. Everything the backend owns goes:
+   * the run and its transcript (messages, tool calls and their results, the active agent, the
+   * verdict), the phase statuses and the artefacts they produced, the shell rows the frames
+   * streamed into, the held approvals, the usage counters, the working list, the logs.
+   *
+   * What survives is this window's own state, which no frame carries: the workspace and its files,
+   * the composer's preferences and pending picks, the panel layout.
+   */
+  forgetSession(): void;
 }
 
 /** Apply an update to one entry, in whichever terminal owns it. */
@@ -443,6 +561,16 @@ function withTabEntry(
   return { terminals };
 }
 
+/**
+ * The list's version of a run's status: it distinguishes only what a row's dot can show, so `done`
+ * and `error` both read as idle — the transcript shows what happened, the row only says whether the
+ * chat is busy.
+ */
+function chatRunStatus(status: RunStatus): ChatRunStatus {
+  if (status === "running" || status === "paused" || status === "cancelled") return status;
+  return "idle";
+}
+
 /** Map a server frame onto a state patch. Pure, so the reducer is easy to reason about. */
 function reduceEvent(state: AppState, message: ServerMessage): Partial<AppState> {
   switch (message.type) {
@@ -458,9 +586,17 @@ function reduceEvent(state: AppState, message: ServerMessage): Partial<AppState>
         ].slice(0, APPROVAL_HISTORY_LIMIT),
         artifacts: message.payload.artifacts,
         messages: message.payload.messages,
-        running: message.payload.status === "running",
+        // Paused is busy: the run is still alive and will continue, so the composer must not treat
+        // the chat as free for a new message.
+        running: message.payload.status === "running" || message.payload.status === "paused",
+        paused: message.payload.status === "paused",
         runError: message.payload.error,
         usage: message.payload.usage,
+        // The frame names the session, which is the chat, so the list's dot can be right without a
+        // round trip. Nothing else about a row is worth guessing from a frame.
+        chats: state.chats.map((chat) =>
+          chat.id === message.sessionId ? { ...chat, runStatus: chatRunStatus(message.payload.status) } : chat,
+        ),
       };
 
     case "usage.updated":
@@ -539,13 +675,67 @@ function reduceEvent(state: AppState, message: ServerMessage): Partial<AppState>
     }
 
     case "agent.error":
-      return { runError: message.payload.message, running: false };
+      return {
+        runError: message.payload.message,
+        running: false,
+        paused: false,
+        chats: state.chats.map((chat) =>
+          chat.id === message.sessionId ? { ...chat, runStatus: "idle" } : chat,
+        ),
+      };
 
     case "agent.done":
       return {
         running: false,
+        paused: false,
         runError: message.payload.status === "error" ? message.payload.summary : state.runError,
+        chats: state.chats.map((chat) =>
+          chat.id === message.sessionId ? { ...chat, runStatus: chatRunStatus(message.payload.status) } : chat,
+        ),
       };
+
+    /*
+     * Side answers arrive on their own three-frame stream and land in their own list. The start
+     * frame is the only one that may have to create the entry: a `/ask` answered before the client
+     * recorded it — a reconnect, a very fast model — must still render, and an entry already
+     * optimistically started is left as it is.
+     */
+    case "agent.answer.start":
+      return {
+        sideAnswers: state.sideAnswers.some((entry) => entry.requestId === message.payload.requestId)
+          ? state.sideAnswers
+          : [
+              {
+                requestId: message.payload.requestId,
+                question: "",
+                content: "",
+                streaming: true,
+                error: null,
+                createdAt: message.ts,
+              },
+              ...state.sideAnswers,
+            ].slice(0, SIDE_ANSWER_LIMIT),
+      };
+
+    case "agent.answer.token": {
+      const { requestId, text } = message.payload;
+      return {
+        sideAnswers: state.sideAnswers.map((entry) =>
+          entry.requestId === requestId
+            ? { ...entry, content: entry.content + text, streaming: true }
+            : entry,
+        ),
+      };
+    }
+
+    case "agent.answer.end": {
+      const { requestId, content, error } = message.payload;
+      return {
+        sideAnswers: state.sideAnswers.map((entry) =>
+          entry.requestId === requestId ? { ...entry, content, streaming: false, error } : entry,
+        ),
+      };
+    }
 
     case "agent.command_request": {
       const card: ApprovalCard = { ...message.payload, decided: null };
@@ -652,9 +842,12 @@ export const useAppStore = create<AppState>()((set, get) => {
   activePhase: "plan",
   artifacts: {},
   autoAdvance: readStoredFlag(AUTO_ADVANCE_KEY, false),
-  model: readStored(MODEL_KEY) ?? "",
+  // Both composer pins are per account and loaded by `bindAccount`; until then there is nothing to
+  // pin with, and an unscoped value would be the previous session's.
+  model: "",
+  providerId: "",
+  accountUid: null,
   reasoningEffort: readStoredReasoningEffort(),
-  models: [],
   // Plan until the phase says otherwise: the composer's default mode is the one the plan phase
   // uses, and AgentChat re-defaults it from the phase the moment it mounts.
   composerMode: "plan",
@@ -667,6 +860,16 @@ export const useAppStore = create<AppState>()((set, get) => {
   todos: [],
   attachments: [],
   usage: EMPTY_USAGE,
+
+  chats: [],
+  chatsLoading: false,
+  chatsError: null,
+  // This folder's chats by default: a chat belongs to the workspace it was started in, and the
+  // "All workspaces" scope is the widening that has to be asked for.
+  chatScope: "workspace",
+  activeChatId: null,
+  sideAnswers: [],
+
   panels: readStoredPanels(),
   settingsOpen: false,
 
@@ -675,6 +878,7 @@ export const useAppStore = create<AppState>()((set, get) => {
   toolResults: {},
   activeAgent: null,
   running: false,
+  paused: false,
   runError: null,
 
   openFiles: [],
@@ -726,16 +930,33 @@ export const useAppStore = create<AppState>()((set, get) => {
   },
 
   setModel: (model) => {
-    writeStored(MODEL_KEY, model);
+    // Signed out, there is no account to hang a pin on, so it stays in memory: persisting it under
+    // the empty uid would put it in the same namespace `bindAccount` reads for the next account.
+    if (get().accountUid !== "") writeStored(pinKey(MODEL_KEY, get().accountUid), model);
     set({ model });
+  },
+
+  setProviderId: (providerId) => {
+    if (get().accountUid !== "") writeStored(pinKey(PROVIDER_KEY, get().accountUid), providerId);
+    set({ providerId });
+  },
+
+  bindAccount: (uid) => {
+    // Read as a pair rather than one at a time: they describe one account's answer to "which
+    // endpoint runs use", and half of it would be a pin nobody made.
+    set({
+      accountUid: uid,
+      // `""` means "no account yet", so it must not read the uid-less namespace back: that is the
+      // pin nobody made, and acting on it pins a run to a provider the user never chose.
+      model: uid ? (readStored(pinKey(MODEL_KEY, uid)) ?? "") : "",
+      providerId: uid ? (readStored(pinKey(PROVIDER_KEY, uid)) ?? "") : "",
+    });
   },
 
   setReasoningEffort: (effort) => {
     writeStored(REASONING_KEY, effort);
     set({ reasoningEffort: effort });
   },
-
-  setModels: (models) => set({ models }),
 
   loadCapabilities: () => {
     // Cached in state, so a second mount is free; a failure leaves the catalogue empty and the
@@ -808,13 +1029,130 @@ export const useAppStore = create<AppState>()((set, get) => {
   setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
   setArtifact: (name, content) => set((state) => ({ artifacts: { ...state.artifacts, [name]: content } })),
 
+  createChat: (input = {}) => {
+    // The workspace is filled from the open project unless the caller names one: a chat started
+    // from the panel belongs to the folder that is on screen, which is what the scope filter reads.
+    const workspace = input.workspace ?? get().project?.projectPath ?? undefined;
+    return api
+      .createChat({ ...input, workspace })
+      .then(({ chat }) => {
+        set((state) => ({ chats: [chat, ...state.chats.filter((row) => row.id !== chat.id)], chatsError: null }));
+        return chat;
+      })
+      .catch((cause: unknown) => {
+        set({ chatsError: errorMessage(cause, "The chat could not be created.") });
+        return null;
+      });
+  },
+
+  renameChat: (id, title) =>
+    api
+      .updateChat(id, { title })
+      .then(({ chat }) => {
+        get().mergeChat(chat);
+      })
+      .catch((cause: unknown) => {
+        set({ chatsError: errorMessage(cause, "The chat could not be renamed.") });
+        throw cause;
+      }),
+
+  clearChat: (id) =>
+    api
+      .clearChat(id)
+      .then(({ chat, state }) => {
+        get().mergeChat(chat);
+        // Only the chat this window is on may write to the transcript; clearing another one must
+        // not blank the conversation that is on screen.
+        if (get().activeChatId === id) get().applySession(state);
+      })
+      .catch((cause: unknown) => {
+        set({ chatsError: errorMessage(cause, "The chat could not be cleared.") });
+        throw cause;
+      }),
+
+  refreshChat: (id) =>
+    api
+      .chat(id)
+      .then(({ chat, state }) => {
+        get().mergeChat(chat);
+        if (get().activeChatId === id) get().applySession(state);
+      })
+      .catch((cause: unknown) => {
+        set({ chatsError: errorMessage(cause, "The chat could not be refreshed.") });
+        throw cause;
+      }),
+
+  deleteChat: (id) =>
+    api
+      .deleteChat(id)
+      .then(({ chats }) => {
+        // The server answers with the whole list, which is the only thing that can be trusted
+        // after a delete: a locally filtered copy would keep a row whose chat is gone.
+        set({ chats, chatsError: null });
+        if (get().activeChatId !== id) return;
+        // The window cannot stay on a chat that no longer exists. It falls back to the newest chat
+        // there is, and to no chat at all — the local id — when that was the last one.
+        const next = chats[0]?.id ?? null;
+        set({ activeChatId: next });
+      })
+      .catch((cause: unknown) => {
+        set({ chatsError: errorMessage(cause, "The chat could not be deleted.") });
+        throw cause;
+      }),
+
+  loadChats: (opts = {}) => {
+    const { chatScope, project, chats } = get();
+    // Nothing to filter by is the same as "show everything": with no folder open, a workspace
+    // filter would hide every chat the account has.
+    const all = chatScope === "all" || project === null;
+    if (opts.quiet !== true || chats.length === 0) set({ chatsLoading: true });
+    return api
+      .listChats({ workspace: all ? null : project.projectPath, all })
+      .then(({ chats: rows }) => set({ chats: rows, chatsLoading: false, chatsError: null }))
+      .catch((cause: unknown) => {
+        set({ chatsLoading: false, chatsError: errorMessage(cause, "The chat list could not be loaded.") });
+      });
+  },
+
+  setChatScope: (chatScope) => {
+    set({ chatScope });
+    void get().loadChats();
+  },
+
+  setActiveChatId: (activeChatId) => set({ activeChatId }),
+
+  mergeChat: (chat) =>
+    set((state) => {
+      const exists = state.chats.some((row) => row.id === chat.id);
+      // Newest first is the list's contract, and a chat the server just touched belongs at the top.
+      const chats = exists
+        ? state.chats.map((row) => (row.id === chat.id ? chat : row))
+        : [chat, ...state.chats];
+      // A row the server just answered about is proof the last failure is over.
+      return { chats, chatsError: null };
+    }),
+
+  setChats: (chats) => set({ chats }),
+
+  startSideAnswer: (requestId, question) =>
+    set((state) => ({
+      sideAnswers: [
+        { requestId, question, content: "", streaming: true, error: null, createdAt: Date.now() },
+        ...state.sideAnswers.filter((entry) => entry.requestId !== requestId),
+      ].slice(0, SIDE_ANSWER_LIMIT),
+    })),
+
+  dismissSideAnswer: (requestId) =>
+    set((state) => ({ sideAnswers: state.sideAnswers.filter((entry) => entry.requestId !== requestId) })),
+
   applySession: (session) =>
     set({
       phaseStatus: session.phases,
       activePhase: session.activePhase,
       artifacts: session.artifacts,
       messages: session.messages,
-      running: session.status === "running",
+      running: session.status === "running" || session.status === "paused",
+      paused: session.status === "paused",
       runError: session.error,
       usage: session.usage,
     }),
@@ -893,8 +1231,19 @@ export const useAppStore = create<AppState>()((set, get) => {
       ],
     })),
 
-  startRun: () => set({ running: true, runError: null, todos: [] }),
-  endRun: (error = null) => set({ running: false, runError: error }),
+  startRun: () =>
+    set((state) => ({
+      running: true,
+      paused: false,
+      runError: null,
+      todos: [],
+      // Optimistic: the dot moves the moment the send is acknowledged locally, and the next
+      // `session.state` frame is what settles it.
+      chats: state.chats.map((chat) =>
+        chat.id === state.activeChatId ? { ...chat, runStatus: "running" } : chat,
+      ),
+    })),
+  endRun: (error = null) => set({ running: false, paused: false, runError: error }),
   resetRun: () =>
     set({
       messages: [],
@@ -902,9 +1251,42 @@ export const useAppStore = create<AppState>()((set, get) => {
       toolResults: {},
       runError: null,
       running: false,
+      paused: false,
       activeAgent: null,
       todos: [],
     }),
+
+  forgetSession: () => {
+    // A fresh shell rather than an emptied one: the tabs themselves came from the session (their
+    // cwd is a path from the previous account's project) and the next account's output streams
+    // into a shell it owns. The id is new, so nothing that still holds the old one can write.
+    const firstTerminal = createTerminalTab("");
+    set({
+      phaseStatus: idlePhases(),
+      activePhase: "plan",
+      artifacts: {},
+      approvals: [],
+      usage: EMPTY_USAGE,
+      logs: [],
+      messages: [],
+      toolCalls: [],
+      toolResults: {},
+      activeAgent: null,
+      running: false,
+      paused: false,
+      runError: null,
+      todos: [],
+      // The chats belong to the account that signed out, so the list goes with it. Nothing here
+      // deletes them from the server — a chat is preserved, only this window stops showing it.
+      chats: [],
+      chatsError: null,
+      activeChatId: null,
+      sideAnswers: [],
+      terminals: [firstTerminal],
+      activeTerminalId: firstTerminal.id,
+      activeCommandId: null,
+    });
+  },
 
   addTerminal: (cwd = "") => {
     const tab = createTerminalTab(cwd);

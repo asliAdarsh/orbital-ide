@@ -9,13 +9,24 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { api, ApiError } from "@/lib/api";
-import { resolveBackendTarget } from "@/lib/backend";
-import { SESSION_ID } from "@/hooks/useAgentSocket";
+import { getAuthToken, resolveBackendTarget, setAuthToken } from "@/lib/backend";
+import { currentSessionId } from "@/hooks/useAgentSocket";
 import { useAppStore } from "@/store/app-store";
 
 const MAX_ATTEMPTS = 20;
 const BASE_DELAY_MS = 400;
 const MAX_DELAY_MS = 3_000;
+
+/**
+ * What the boot screen says when nothing supplied a token.
+ *
+ * The runtime refuses every caller without one, so probing anyway would only paint a wall of
+ * identical 401s over the one sentence that explains what is missing.
+ */
+const NO_RUNTIME_TOKEN =
+  "This build has no Orbital runtime token. Start the backend with `npm run backend:dev` — it " +
+  "mints a token and writes VITE_ORBITAL_TOKEN into frontend/.env.local for the dev server; " +
+  "the desktop app reads it from the Tauri host instead.";
 
 export interface BackendBoot {
   ready: boolean;
@@ -29,12 +40,20 @@ export function useBackendBoot(): BackendBoot {
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Resolve the origin once: Tauri hands out a dynamic port, the browser build a fixed one.
+  // Resolve the origin once: Tauri hands out a dynamic port and the token that goes with it, the
+  // browser build a fixed port and the dev server's token.
   useEffect(() => {
     let cancelled = false;
     resolveBackendTarget()
       .then((target) => {
-        if (!cancelled) useAppStore.getState().setBackendBase(target.baseUrl);
+        if (cancelled) return;
+        setAuthToken(target.token);
+        if (target.token === null) {
+          // No origin is published either: a request would only produce an unexplained refusal.
+          setError(NO_RUNTIME_TOKEN);
+          return;
+        }
+        useAppStore.getState().setBackendBase(target.baseUrl);
       })
       .catch((cause: unknown) => {
         if (cancelled) return;
@@ -50,7 +69,7 @@ export function useBackendBoot(): BackendBoot {
   }, [attemptKey]);
 
   useEffect(() => {
-    if (!base) return;
+    if (!base || getAuthToken() === null) return;
     let cancelled = false;
     let timer: number | null = null;
     let attempt = 0;
@@ -75,7 +94,7 @@ export function useBackendBoot(): BackendBoot {
           if (cancelled) return;
           store().setProject(project);
           if (project.projectPath) {
-            const [tree, session] = await Promise.all([api.tree(), api.session(SESSION_ID)]);
+            const [tree, session] = await Promise.all([api.tree(), api.session(currentSessionId())]);
             if (cancelled) return;
             store().setTree(tree);
             store().applySession(session);

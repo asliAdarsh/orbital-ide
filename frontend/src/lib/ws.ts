@@ -8,6 +8,7 @@
  * not happened.
  */
 
+import { getAuthToken } from "@/lib/backend";
 import { PROTOCOL_VERSION, type ClientMessage, type ServerMessage } from "@/types/protocol";
 
 export type SocketStatus = "connecting" | "open" | "closed";
@@ -64,6 +65,10 @@ export class OrbitalSocket {
     socket.onopen = () => {
       this.attempt = 0;
       this.lastSeq = 0;
+      // First frame, always: the runtime closes a socket that does not present its token within
+      // five seconds, and it accepts nothing else until this one arrives.
+      const token = getAuthToken();
+      this.send({ type: "auth", token: token ?? "" });
       this.setStatus("open");
       this.startHeartbeat();
     };
@@ -106,6 +111,25 @@ export class OrbitalSocket {
 
   cancelAgent(sessionId: string): void {
     this.send({ type: "agent.cancel", sessionId });
+  }
+
+  /** Stop at the next step boundary; the run's state survives for {@link resumeAgent}. */
+  pauseAgent(sessionId: string): void {
+    this.send({ type: "agent.pause", sessionId });
+  }
+
+  resumeAgent(sessionId: string): void {
+    this.send({ type: "agent.resume", sessionId });
+  }
+
+  /** A side question about the run in flight; its answer comes back tagged with `requestId`. */
+  askAgent(sessionId: string, question: string, requestId: string): void {
+    this.send({ type: "agent.ask", sessionId, question, requestId });
+  }
+
+  /** Stop one side answer. The run it asked about is untouched. */
+  cancelAsk(requestId: string): void {
+    this.send({ type: "agent.ask.cancel", requestId });
   }
 
   exec(sessionId: string, commandId: string, command: string, cwd: string, timeout?: number | null): void {

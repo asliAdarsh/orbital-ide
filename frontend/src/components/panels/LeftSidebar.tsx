@@ -13,6 +13,7 @@ import { SectionLabel } from "@/components/common/SectionLabel";
 import { toast } from "@/components/common/Toaster";
 import { PhaseStepper } from "@/components/phases/PhaseStepper";
 import { ProfilePopover } from "@/components/panels/ProfilePopover";
+import { SessionsPanel } from "@/components/panels/SessionsPanel";
 import { AGENTS_MD_PATH, PLAN_PATH, TEST_REPORT_PATH } from "@/types/protocol";
 
 /** Context artefacts the pipeline produces, in the order the phases create them. */
@@ -93,6 +94,9 @@ export function LeftSidebar() {
       <div {...handleProps} className="group absolute inset-y-0 -right-1 z-10 w-2 cursor-col-resize">
         <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-transparent transition-colors group-hover:bg-primary" />
       </div>
+      {/* Conversations first: which chat this window is on is what everything below it acts on, and
+          the phase stepper and the tree are both per-session views of the open folder. */}
+      <SessionsPanel />
       <SectionLabel>Phases</SectionLabel>
       <PhaseStepper activePhase={activePhase} status={phaseStatus} onSelect={setActivePhase} />
 

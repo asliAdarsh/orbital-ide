@@ -1,0 +1,11 @@
+{
+  /* The tests are checked with the same strictness as the function, but they are never emitted:
+     `tsx` runs them straight from source, and only `dist/` is deployed. */
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "outDir": "dist"
+  },
+  "include": ["src", "test"]
+}

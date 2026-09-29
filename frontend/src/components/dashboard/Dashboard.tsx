@@ -12,6 +12,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   ArrowUpDown,
   BookOpen,
+  CloudOff,
   FileText,
   FolderGit2,
   LayoutGrid,
@@ -24,6 +25,8 @@ import {
 } from "lucide-react";
 
 import { useOpenProject } from "@/hooks/useOpenProject";
+import { useProjectSync } from "@/hooks/useProjectSync";
+import type { SyncedProject } from "@/lib/firestore";
 import { useAppStore } from "@/store/app-store";
 import { type ProjectEntry } from "@/types/protocol";
 import { EmptyState } from "@/components/common/EmptyState";
@@ -37,6 +40,8 @@ import { LearnDialog } from "@/components/dashboard/LearnDialog";
 import { NewProjectDialog } from "@/components/dashboard/NewProjectDialog";
 import { ProfilePopover } from "@/components/panels/ProfilePopover";
 import { ProjectCard, ProjectRow } from "@/components/dashboard/ProjectCard";
+import { SyncPanel } from "@/components/dashboard/SyncPanel";
+import { SyncedProjectCard, SyncedProjectRow } from "@/components/dashboard/SyncedProject";
 import type { ProjectActionHandlers } from "@/components/dashboard/ProjectActions";
 
 /** The sorts the corpus supports, in menu order. */
@@ -62,7 +67,21 @@ type ScopeId = (typeof SCOPES)[number]["id"];
 
 const DAY_MS = 86_400_000;
 
-function withinScope(project: ProjectEntry, scope: ScopeId, now: number): boolean {
+/**
+ * What the filters and sorts need of a project. `ProjectEntry` satisfies it as it is, and a record
+ * the account holds is adapted into it — one list of rules, so a stored project is searched,
+ * scoped and sorted exactly like one from the registry.
+ */
+interface Listable {
+  favourite: boolean;
+  lastOpenedAt: number;
+  createdAt: number;
+  name: string;
+  path: string;
+  description: string | null;
+}
+
+function withinScope(project: Pick<Listable, "favourite" | "lastOpenedAt">, scope: ScopeId, now: number): boolean {
   if (scope === "all") return true;
   if (scope === "favourites") return project.favourite;
   // A project with no recorded opening (cleared from recents) belongs to no recent window.
@@ -73,7 +92,7 @@ function withinScope(project: ProjectEntry, scope: ScopeId, now: number): boolea
   return age >= 7 * DAY_MS;
 }
 
-function matchesQuery(project: ProjectEntry, query: string): boolean {
+function matchesQuery(project: Pick<Listable, "name" | "path" | "description">, query: string): boolean {
   if (!query) return true;
   const needle = query.toLowerCase();
   return (
@@ -81,6 +100,36 @@ function matchesQuery(project: ProjectEntry, query: string): boolean {
     project.path.toLowerCase().includes(needle) ||
     (project.description ?? "").toLowerCase().includes(needle)
   );
+}
+
+/** The visible slice of one list: narrowed by scope and search, then ordered. */
+function arrange<T extends Listable>(projects: readonly T[], scope: ScopeId, query: string, sort: SortId): T[] {
+  const filtered = projects.filter(
+    (project) => withinScope(project, scope, Date.now()) && matchesQuery(project, query),
+  );
+  const sorted = [...filtered];
+  if (sort === "name") sorted.sort((a, b) => a.name.localeCompare(b.name));
+  else if (sort === "created") sorted.sort((a, b) => b.createdAt - a.createdAt);
+  else sorted.sort((a, b) => b.lastOpenedAt - a.lastOpenedAt);
+  return sorted;
+}
+
+/**
+ * A stored record as the list's own shape.
+ *
+ * It has no favourite (that is a local opinion, and the account does not hold it) and no separate
+ * creation time — the only time a record carries is when it was last written, which is what both
+ * orderings then read.
+ */
+function asListable(project: SyncedProject): SyncedProject & Listable {
+  return {
+    ...project,
+    favourite: false,
+    lastOpenedAt: project.updatedAt,
+    createdAt: project.updatedAt,
+    name: project.title,
+    description: null,
+  };
 }
 
 export function Dashboard() {
@@ -92,6 +141,9 @@ export function Dashboard() {
   const setSettingsOpen = useAppStore((state) => state.setSettingsOpen);
 
   const { open, error: openError } = useOpenProject();
+  // The account's copy of this list lives here rather than in `App` because this is the surface
+  // that shows projects: a user who never opens the launcher never syncs anything.
+  const sync = useProjectSync();
 
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState<SortId>("opened");
@@ -111,16 +163,25 @@ export function Dashboard() {
 
   // Memoised because it re-runs on every keystroke; the plain filters below are cheap enough to
   // sit in the render.
-  const visible = useMemo(() => {
-    const filtered = projects.filter(
-      (project) => withinScope(project, scope, Date.now()) && matchesQuery(project, query),
-    );
-    const sorted = [...filtered];
-    if (sort === "name") sorted.sort((a, b) => a.name.localeCompare(b.name));
-    else if (sort === "created") sorted.sort((a, b) => b.createdAt - a.createdAt);
-    else sorted.sort((a, b) => b.lastOpenedAt - a.lastOpenedAt);
-    return sorted;
-  }, [projects, query, scope, sort]);
+  const visible = useMemo(() => arrange(projects, scope, query, sort), [projects, query, scope, sort]);
+
+  // The account's records that are not on this machine: they are projects a person can search for
+  // and recognise, so they go through the same filters rather than sitting in a fixed block.
+  const stored = useMemo(() => sync.elsewhere.map(asListable), [sync.elsewhere]);
+  const storedVisible = useMemo(() => arrange(stored, scope, query, sort), [stored, query, scope, sort]);
+
+  // The rail's counts cover both lists: a record on the account is a project in its scope too, and
+  // a count that disagreed with the tiles under it would be a small lie in the one place a user
+  // goes to check what the launcher holds.
+  const counts = useMemo(() => {
+    const tally: Record<ScopeId, number> = { all: 0, recent: 0, favourites: 0, week: 0, older: 0 };
+    for (const entry of SCOPES) {
+      tally[entry.id] =
+        projects.filter((project) => withinScope(project, entry.id, now)).length +
+        stored.filter((project) => withinScope(project, entry.id, now)).length;
+    }
+    return tally;
+  }, [projects, stored, now]);
 
   const handlers: ProjectActionHandlers = {
     onOpen: (project) => void open(project.path),
@@ -141,8 +202,12 @@ export function Dashboard() {
   };
 
   const showNewTile = query === "" && (scope === "all" || scope === "favourites");
-  const empty = !loading && projects.length === 0;
-  const nothingHere = !loading && projects.length > 0 && visible.length === 0;
+  // A record the account holds is a project the launcher can show, so an account with nothing on
+  // this machine is not an empty launcher — it is one showing projects from elsewhere.
+  const known = projects.length + sync.elsewhere.length;
+  const shown = visible.length + storedVisible.length;
+  const empty = !loading && known === 0;
+  const nothingHere = !loading && known > 0 && shown === 0;
 
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
@@ -237,30 +302,33 @@ export function Dashboard() {
               >
                 <span className="min-w-0 flex-1 truncate">{entry.label}</span>
                 <span className="shrink-0 font-mono text-2xs text-muted-foreground/70">
-                  {projects.filter((project) => withinScope(project, entry.id, now)).length}
+                  {counts[entry.id]}
                 </span>
               </button>
             ))}
           </nav>
 
-          <div className="mt-auto flex flex-col gap-0.5 border-t border-border p-2">
-            <button
-              type="button"
-              onClick={() => setLearning(true)}
-              className="flex items-center gap-2 rounded px-2 py-1 text-left text-2xs text-muted-foreground transition-colors hover:bg-chrome-raised hover:text-foreground"
-            >
-              <BookOpen className="h-3.5 w-3.5" />
-              Learn
-            </button>
-            <button
-              type="button"
-              onClick={() => setSettingsOpen(true)}
-              className="flex items-center gap-2 rounded px-2 py-1 text-left text-2xs text-muted-foreground transition-colors hover:bg-chrome-raised hover:text-foreground"
-            >
-              <Settings className="h-3.5 w-3.5" />
-              Settings
-            </button>
-            <ProfilePopover label="Account" />
+          <div className="mt-auto flex flex-col">
+            <SyncPanel sync={sync} />
+            <div className="flex flex-col gap-0.5 border-t border-border p-2">
+              <button
+                type="button"
+                onClick={() => setLearning(true)}
+                className="flex items-center gap-2 rounded px-2 py-1 text-left text-2xs text-muted-foreground transition-colors hover:bg-chrome-raised hover:text-foreground"
+              >
+                <BookOpen className="h-3.5 w-3.5" />
+                Learn
+              </button>
+              <button
+                type="button"
+                onClick={() => setSettingsOpen(true)}
+                className="flex items-center gap-2 rounded px-2 py-1 text-left text-2xs text-muted-foreground transition-colors hover:bg-chrome-raised hover:text-foreground"
+              >
+                <Settings className="h-3.5 w-3.5" />
+                Settings
+              </button>
+              <ProfilePopover label="Account" />
+            </div>
           </div>
         </aside>
 
@@ -343,6 +411,15 @@ export function Dashboard() {
                       handlers={handlers}
                     />
                   ))}
+                  {storedVisible.length > 0 ? (
+                    <li className="col-span-full flex items-center gap-1.5 pt-2 text-2xs text-muted-foreground/70">
+                      <CloudOff aria-hidden className="h-3 w-3" />
+                      On your account, not on this machine
+                    </li>
+                  ) : null}
+                  {storedVisible.map((project) => (
+                    <SyncedProjectCard key={project.documentId} project={project} />
+                  ))}
                 </ul>
               ) : (
                 <ul>
@@ -354,6 +431,15 @@ export function Dashboard() {
                       onOpen={(target) => void open(target.path)}
                       handlers={handlers}
                     />
+                  ))}
+                  {storedVisible.length > 0 ? (
+                    <li className="flex items-center gap-1.5 px-3 pt-2 text-2xs text-muted-foreground/70">
+                      <CloudOff aria-hidden className="h-3 w-3" />
+                      On your account, not on this machine
+                    </li>
+                  ) : null}
+                  {storedVisible.map((project) => (
+                    <SyncedProjectRow key={project.documentId} project={project} />
                   ))}
                 </ul>
               )}

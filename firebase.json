@@ -1,0 +1,14 @@
+{
+  "emulators": {
+    "auth": { "port": 9099 },
+    "firestore": { "port": 8080 },
+    "ui": { "enabled": true, "port": 4000 },
+    "singleProjectMode": true
+  },
+  "firestore": { "rules": "firestore.rules" },
+  "functions": {
+    "source": "gateway",
+    "runtime": "nodejs20",
+    "predeploy": ["npm --prefix \"$RESOURCE_DIR\" run build"]
+  }
+}

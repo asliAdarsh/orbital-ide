@@ -32,10 +32,12 @@ from typing import Annotated, Any, Awaitable, Callable, Literal, TypedDict
 from uuid import uuid4
 
 from langchain.agents import create_agent
-from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage
+from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph, add_messages
-from langgraph.types import RetryPolicy
+from langgraph.prebuilt.tool_node import ToolCallRequest
+from langgraph.types import Command, RetryPolicy
 
 from orbital_backend.errors import logger as _error_logger
 from orbital_backend.events import EventBus, bus
@@ -51,6 +53,7 @@ from orbital_backend.models import (
     MessageRole,
     Permission,
     Phase,
+    ProviderProfile,
     next_phase,
 )
 from orbital_backend.services.approvals import approvals
@@ -136,6 +139,45 @@ _BARE_DECISION = re.compile(r"\b(ADVANCE|RETRY|STOP)\b")
 Emitter = Callable[..., Awaitable[None]]
 
 
+async def never_paused() -> None:
+    """The step boundary of a run that cannot be paused: a context built without a gate."""
+    return None
+
+
+class StepBoundary(AgentMiddleware):
+    """Holds a specialist at its next model or tool call while the run is paused.
+
+    LangGraph runs the graph ahead of whoever is reading its event stream, so a pause enforced
+    on the reader's side would let a paused run keep calling the model and running commands
+    behind the user's back. The gate therefore sits where a step actually begins — both of the
+    hooks below await the run's boundary before letting the step happen, which is what makes a
+    pause mean "this run has stopped" rather than "its output is being withheld".
+
+    The hook is awaited before the call rather than during it, so a paused run holds no provider
+    connection and no running command: only its place in the graph.
+    """
+
+    def __init__(self, boundary: Callable[[], Awaitable[None]]) -> None:
+        super().__init__()
+        self._boundary = boundary
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: Callable[[ModelRequest[Any]], Awaitable[ModelResponse[Any]]],
+    ) -> ModelResponse[Any] | AIMessage:
+        await self._boundary()
+        return await handler(request)
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        await self._boundary()
+        return await handler(request)
+
+
 @dataclass(slots=True)
 class RunContext:
     """Everything a node needs that is not part of the graph state."""
@@ -149,6 +191,10 @@ class RunContext:
     bus: EventBus
     #: Model override for this run; ``None`` uses ORBITAL_LLM_MODEL.
     model: str | None = None
+    #: The provider profile this run is pinned to, or ``None`` for the active one. Held as the
+    #: resolved profile rather than its id so the whole run talks to one endpoint: a run that read
+    #: the id back would follow the user's next activation halfway through its own phases.
+    provider: ProviderProfile | None = None
     #: How hard every model this run builds should think. ``None`` sends no parameter at all,
     #: because a gateway that does not know it may refuse the request.
     reasoning_effort: str | None = None
@@ -160,6 +206,9 @@ class RunContext:
     #: The composer's approval mode, applied to the session before the turn starts so the first
     #: command already sees it.
     permission: Permission | None = None
+    #: Awaited before every model call and every tool call this run makes: the run's pause gate.
+    #: The runner injects it; a context built without one (a test, a tool) simply never pauses.
+    step_boundary: Callable[[], Awaitable[None]] = never_paused
 
     @property
     def root(self) -> Path:
@@ -423,6 +472,7 @@ def build_chat_agent(ctx: RunContext) -> Any:
         max_tokens=DISCUSSION_MAX_TOKENS,
         model=ctx.model,
         reasoning_effort=ctx.reasoning_effort,
+        profile=ctx.provider,
     )
     tools = [t for t in _tools_for(ctx, AgentId.ARCHITECT) if t.name not in CHAT_EXCLUDED_TOOLS]
     return create_agent(
@@ -433,6 +483,7 @@ def build_chat_agent(ctx: RunContext) -> Any:
             + DISCUSSION_RULES
             + environment_block(ctx.root)
         ),
+        middleware=[StepBoundary(ctx.step_boundary)],
         name="architect_discussion",
     )
 
@@ -447,9 +498,13 @@ def build_graph(ctx: RunContext) -> Any:
         max_tokens=ORCHESTRATOR_MAX_TOKENS,
         model=ctx.model,
         reasoning_effort=ctx.reasoning_effort,
+        profile=ctx.provider,
     )
     specialist_model = build_llm(
-        session_id=ctx.session_id, model=ctx.model, reasoning_effort=ctx.reasoning_effort
+        session_id=ctx.session_id,
+        model=ctx.model,
+        reasoning_effort=ctx.reasoning_effort,
+        profile=ctx.provider,
     )
 
     async def orchestrate_brief(state: OrbitalState, phase: Phase) -> dict[str, Any]:
@@ -549,6 +604,9 @@ def build_graph(ctx: RunContext) -> Any:
         }
 
     async def orchestrator(state: OrbitalState) -> dict[str, Any]:
+        # The node's first act is a model call, so its step boundary is here: a pause that
+        # arrived while the specialist was working stops the run before the verdict is asked for.
+        await ctx.step_boundary()
         phase = Phase(state.get("phase") or ctx.phase.value)
         if state.get("stage") == "post":
             return await orchestrate_verdict(state, phase)
@@ -570,6 +628,7 @@ def build_graph(ctx: RunContext) -> Any:
                 # The environment is appended per run: the same prompt on a different machine
                 # has to describe a different shell.
                 system_prompt=SPECIALIST_PROMPTS[agent] + environment_block(ctx.root),
+                middleware=[StepBoundary(ctx.step_boundary)],
                 name=agent.value,
             ),
             retry_policy=RETRY_POLICY,

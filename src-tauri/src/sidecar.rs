@@ -22,6 +22,10 @@ use crate::error::AppError;
 const SIDECAR_NAME: &str = "orbital-backend";
 /// Token the backend prints on stdout once uvicorn is serving traffic.
 const READY_MARKER: &str = "ORBITAL_BACKEND_READY";
+/// Prefix of the token field on that line. The sidecar mints the token and prints it, because this
+/// host has no token to give it — see `orbital_backend.auth` for why the runtime refuses callers
+/// that do not present it.
+const TOKEN_FIELD: &str = "token=";
 /// Emitted with the resolved [`BackendInfo`] when the backend reports readiness. The frontend must
 /// re-read the base URL from this payload: a restart moves the backend to a different port.
 pub const EVENT_READY: &str = "backend://ready";
@@ -44,6 +48,10 @@ pub struct BackendInfo {
     pub managed: bool,
     pub pid: Option<u32>,
     pub status: String,
+    /// The secret every request and socket has to present, exactly as the sidecar printed it.
+    /// It never goes into a bundle: the webview reads it from here at startup, and a restart hands
+    /// out the new one through the same command and the `backend://ready` event.
+    pub token: Option<String>,
 }
 
 /// Payload of [`EVENT_EXITED`].
@@ -89,6 +97,9 @@ pub struct BackendState {
     ready_tx: Option<oneshot::Sender<u16>>,
     /// Handle kept so the process can be killed through the shell plugin rather than by pid.
     child: Option<CommandChild>,
+    /// Resolved by the stdout pump from the same readiness line as the port. Cleared on stop, so
+    /// nothing is handed out for a process that is not running.
+    token: Option<String>,
 }
 
 impl BackendState {
@@ -100,6 +111,7 @@ impl BackendState {
             child_id: None,
             ready_tx: None,
             child: None,
+            token: None,
         }
     }
 
@@ -110,6 +122,7 @@ impl BackendState {
             managed: self.child_id.is_some(),
             pid: self.child_id,
             status: self.status.as_str().to_string(),
+            token: self.token.clone(),
         }
     }
 }
@@ -155,6 +168,7 @@ pub fn stop(state: &Mutex<BackendState>) {
         guard.generation += 1;
         guard.ready_tx = None;
         guard.status = BackendStatus::Stopped;
+        guard.token = None;
         (guard.child_id.take(), guard.child.take())
     };
     if let Some(pid) = pid {
@@ -299,18 +313,25 @@ async fn pump(
         match event {
             CommandEvent::Stdout(bytes) => {
                 let line = String::from_utf8_lossy(&bytes);
-                log::info!("[backend] {}", line.trim_end());
-                if let Some(port) = parse_ready_port(&line) {
-                    let ready_tx = {
-                        let mut guard = lock_state(&state);
-                        if guard.generation == generation {
-                            guard.ready_tx.take()
-                        } else {
-                            None
+                match parse_ready_port(&line) {
+                    None => log::info!("[backend] {}", line.trim_end()),
+                    Some(port) => {
+                        // The readiness line carries the token, and this log reaches a terminal and
+                        // whatever collects the host's stderr, so it is reported without it.
+                        log::info!("{READY_MARKER} port={port} (token received)");
+                        let token = parse_ready_token(&line);
+                        let ready_tx = {
+                            let mut guard = lock_state(&state);
+                            if guard.generation == generation {
+                                guard.token = token;
+                                guard.ready_tx.take()
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(ready_tx) = ready_tx {
+                            let _ = ready_tx.send(port);
                         }
-                    };
-                    if let Some(ready_tx) = ready_tx {
-                        let _ = ready_tx.send(port);
                     }
                 }
             }
@@ -383,6 +404,21 @@ fn parse_ready_port(line: &str) -> Option<u16> {
         .take_while(|character| character.is_ascii_digit())
         .collect();
     digits.parse().ok()
+}
+
+/// Extracts `<token>` from the backend's `… token=<token>` handshake field.
+///
+/// The token is url-safe base64, so it never contains whitespace: the field ends at the first
+/// space or line ending. An empty value is `None` — a backend that printed no token is not one to
+/// hand a blank credential to.
+fn parse_ready_token(line: &str) -> Option<String> {
+    let rest = line.split_once(TOKEN_FIELD)?.1;
+    let token: String = rest.chars().take_while(|character| !character.is_whitespace()).collect();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
 }
 
 /// Locates the Python backend checkout for `tauri dev`. Tauri runs the dev binary from

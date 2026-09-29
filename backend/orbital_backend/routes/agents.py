@@ -12,13 +12,14 @@ from functools import partial
 from fastapi import APIRouter
 
 from orbital_backend.agents import runner as agent_runner
-from orbital_backend.errors import logger
+from orbital_backend.errors import NotFoundError, ToolError, logger
 from orbital_backend.models import (
     ChatTurnRequest,
     OkResponse,
     Permission,
     Phase,
     PhaseStatus,
+    ProviderProfile,
     RunAccepted,
     RunAgentRequest,
     RunStatus,
@@ -28,12 +29,33 @@ from orbital_backend.models import (
     validate_capabilities,
     validate_reasoning_effort,
 )
+from orbital_backend.services.providers import providers
 from orbital_backend.services.sessions import sessions
 from orbital_backend.services.workspace import workspace
 
 router = APIRouter(prefix="/api", tags=["agents"])
 
 _log = logger(__name__)
+
+
+def _pinned_provider(provider_id: str | None) -> ProviderProfile | None:
+    """The profile a run is pinned to, or the refusal naming an id that names nothing.
+
+    Resolved here rather than inside the run: by the time the run needs an endpoint it is a
+    background task, and an id the user typed or a UI sent stale has to come back as a 400 on the
+    request that carried it, not as an error frame later.
+
+    The active profile is deliberately left alone — the pin is this run's choice, and moving the
+    badge would silently change what every other session talks to.
+    """
+    if not provider_id:
+        return None
+    try:
+        return providers.find(provider_id)
+    except NotFoundError as exc:
+        raise ToolError(
+            f"unknown providerId {provider_id!r}: no configured provider profile has that id"
+        ) from exc
 
 
 def _on_run_finished(session_id: str, task: asyncio.Task[None]) -> None:
@@ -56,6 +78,7 @@ async def run_phase(
     auto_advance: bool,
     model: str | None = None,
     *,
+    provider_id: str | None = None,
     attachments: list[str] | None = None,
     reasoning_effort: str | None = None,
     capabilities: list[str] | None = None,
@@ -68,6 +91,9 @@ async def run_phase(
     # The same for an unknown capability, which is worse: dropping it would run the agent with
     # every tool the caller meant to withhold.
     enabled = validate_capabilities(capabilities)
+    # And for an unknown provider, which would otherwise be discovered only when the run reached
+    # for a model — after the session had already been marked running.
+    provider = _pinned_provider(provider_id)
     if project_path:
         workspace.set_root(project_path)
     sessions.ensure(session_id)
@@ -85,6 +111,7 @@ async def run_phase(
             project_path,
             auto_advance,
             model,
+            provider=provider,
             attachments=attachments,
             reasoning_effort=effort,
             capabilities=enabled,
@@ -103,6 +130,7 @@ async def chat_phase(
     project_path: str,
     model: str | None = None,
     *,
+    provider_id: str | None = None,
     attachments: list[str] | None = None,
     reasoning_effort: str | None = None,
     capabilities: list[str] | None = None,
@@ -115,6 +143,7 @@ async def chat_phase(
     """
     effort = validate_reasoning_effort(reasoning_effort)
     enabled = validate_capabilities(capabilities)
+    provider = _pinned_provider(provider_id)
     if project_path:
         workspace.set_root(project_path)
     sessions.ensure(session_id)
@@ -130,6 +159,7 @@ async def chat_phase(
             message,
             project_path,
             model,
+            provider=provider,
             attachments=attachments,
             reasoning_effort=effort,
             capabilities=enabled,
@@ -158,6 +188,7 @@ async def start_run(body: RunAgentRequest) -> RunAccepted:
         body.project_path,
         body.auto_advance,
         body.model,
+        provider_id=body.provider_id,
         attachments=body.attachments,
         reasoning_effort=body.reasoning_effort,
         capabilities=body.capabilities,
@@ -174,6 +205,7 @@ async def start_chat(body: ChatTurnRequest) -> RunAccepted:
         body.message,
         body.project_path,
         body.model,
+        provider_id=body.provider_id,
         attachments=body.attachments,
         reasoning_effort=body.reasoning_effort,
         capabilities=body.capabilities,

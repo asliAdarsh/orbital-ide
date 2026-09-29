@@ -67,6 +67,10 @@ class PhaseStatus(StrEnum):
 class RunStatus(StrEnum):
     IDLE = "idle"
     RUNNING = "running"
+    #: The run stopped at a step boundary and its state is intact: ``resume`` continues it, where
+    #: ``cancelled`` discards. A paused run is not a finished one, which is why it is its own
+    #: value rather than an idle state the composer would offer to start over from.
+    PAUSED = "paused"
     DONE = "done"
     ERROR = "error"
     CANCELLED = "cancelled"
@@ -83,6 +87,24 @@ class BranchStrategyId(StrEnum):
     TRUNK = "trunk"
     GITHUB_FLOW = "github-flow"
     GIT_FLOW = "git-flow"
+
+
+class ProviderKind(StrEnum):
+    """The shapes a provider profile takes.
+
+    ``OPENAI_COMPATIBLE`` is every hosted provider — each one publishes an endpoint that speaks
+    OpenAI's chat-completions shape, some through a compatibility layer of their own. ``LOCAL`` is
+    the same client pointed at a server on this machine or the user's network: no key, and an
+    endpoint that may simply be off. ``ORBITAL`` is this repository's own gateway (``gateway/``):
+    the same client again, at a URL the client derives from its Firebase project, presenting the
+    signed-in account's ID token in place of a key, so nothing is pasted and the Orbital key stays
+    server-side. In every other respect it is configured like ``OPENAI_COMPATIBLE`` — a base URL
+    and a model — which is why the run path needs no case for it.
+    """
+
+    OPENAI_COMPATIBLE = "openai-compatible"
+    ORBITAL = "orbital"
+    LOCAL = "local"
 
 
 PHASE_ORDER: tuple[Phase, ...] = (Phase.PLAN, Phase.DESIGN, Phase.BUILD, Phase.TEST, Phase.SYNC)
@@ -577,6 +599,349 @@ class GitInitRequest(APIModel):
     remote: str | None = None
 
 
+# --------------------------------------------------------------------------------------
+# Provider profiles — the endpoints a run may talk to, and where each one points by default.
+#
+# The client's mirror of this section arrives with the onboarding UI that renders it; until then
+# these shapes exist only on this side of the wire.
+# --------------------------------------------------------------------------------------
+
+
+#: Where a profile's model list came from: the provider's own ``/models`` answer, or the curated
+#: seed its preset carries. ``None`` on a profile that has never been connected, which is why the
+#: empty list and the unfetched one are distinguishable.
+ModelSource = Literal["provider", "preset"]
+
+
+class ProviderPreset(APIModel):
+    """One provider the picker offers, with the values a profile starts from.
+
+    Every preset is OpenAI-compatible: the four agents speak OpenAI's chat-completions shape, and
+    each provider here publishes an endpoint that accepts it — Anthropic and Gemini through the
+    compatibility layers they ship, Ollama and LM Studio because they were built to match it.
+
+    ``orbital`` is the one exception to "the preset carries the values", and only in the URL: the
+    gateway's address is built from the client's own Firebase project and from whether that build
+    talks to the emulator, so the client derives it and the preset has no URL to offer.
+    """
+
+    id: str
+    label: str
+    kind: ProviderKind
+    #: Prefilled into a new profile and editable there: a company gateway, a proxy or a different
+    #: port is the same preset with another URL. ``None`` for a preset whose URL the client
+    #: computes, which today means only ``orbital``.
+    base_url: str | None = None
+    #: Prefilled too. The live model list replaces it once the endpoint answers.
+    model: str
+    #: Whether this endpoint cannot answer without a key. The form asks for one; the backend still
+    #: stores a keyless profile, because the connection test is what tells the user it is missing.
+    api_key_required: bool
+    #: What the dropdown shows when the provider itself will not list its models. A **maintained
+    #: seed**, not discovered truth: it is the preset's own model plus the ids this repository last
+    #: saw offered, and a provider that answers ``/models`` replaces it wholesale. Off the wire on
+    #: purpose — the client renders the list the connect step stored, never this table — so the
+    #: preset payload keeps the shape the settings page and the onboarding form already read.
+    #: Empty for ``orbital``, ``ollama`` and ``lmstudio``, which each serve ``/models`` themselves
+    #: whenever they are up: a seed for one of those would be a guess about someone else's machine,
+    #: and an empty tuple is what makes the connect step ask for a model by hand instead.
+    fallback_models: tuple[str, ...] = Field(default=(), exclude=True)
+
+
+#: The providers the settings page offers, and the only list either side needs: the client renders
+#: this table as it arrives and hardcodes nothing, so a provider is added here and nowhere else.
+#: Ordered the way the page shows them — the account's own gateway first, because it is the one
+#: that asks for nothing pasted; then the endpoint this repository defaults to; the local runtime
+#: last.
+PROVIDER_PRESETS: tuple[ProviderPreset, ...] = (
+    ProviderPreset(
+        id="orbital",
+        label="Orbital",
+        kind=ProviderKind.ORBITAL,
+        # No URL: the client builds it from its Firebase project id, and from the emulator flag —
+        # `http://127.0.0.1:5001/<project>/us-central1/orbital/v1` locally, the deployed
+        # `https://us-central1-<project>.cloudfunctions.net/orbital/v1` otherwise. A placeholder
+        # here would be a URL that is wrong for every deployment.
+        base_url=None,
+        # The gateway's catalogue today, and the model a profile is created with when the
+        # catalogue call failed. The live list replaces it whenever the gateway answers.
+        model="deepseek-v4-flash",
+        # The "key" is the signed-in account's ID token, which the app refreshes and stores
+        # itself; the form never asks for one.
+        api_key_required=False,
+    ),
+    ProviderPreset(
+        id="opencode-go",
+        label="OpenCode Go",
+        kind=ProviderKind.OPENAI_COMPATIBLE,
+        base_url="https://opencode.ai/zen/go/v1",
+        model="deepseek-v4-flash",
+        api_key_required=True,
+        fallback_models=("deepseek-v4-flash", "deepseek-v4-pro"),
+    ),
+    ProviderPreset(
+        id="zen",
+        label="OpenCode Zen",
+        kind=ProviderKind.OPENAI_COMPATIBLE,
+        base_url="https://opencode.ai/zen/v1",
+        model="deepseek-v4-flash",
+        api_key_required=True,
+        fallback_models=("deepseek-v4-flash", "deepseek-v4-pro"),
+    ),
+    ProviderPreset(
+        id="openai",
+        label="OpenAI",
+        kind=ProviderKind.OPENAI_COMPATIBLE,
+        base_url="https://api.openai.com/v1",
+        model="gpt-4o",
+        api_key_required=True,
+        fallback_models=("gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini"),
+    ),
+    ProviderPreset(
+        id="anthropic",
+        label="Anthropic (Claude)",
+        kind=ProviderKind.OPENAI_COMPATIBLE,
+        # Anthropic's OpenAI-compatibility layer, so a Claude model arrives in the shape the
+        # agents already speak rather than needing a second client.
+        base_url="https://api.anthropic.com/v1",
+        model="claude-sonnet-4-20250514",
+        api_key_required=True,
+        fallback_models=(
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-20250514",
+            "claude-3-7-sonnet-20250219",
+            "claude-3-5-haiku-20241022",
+        ),
+    ),
+    ProviderPreset(
+        id="gemini",
+        label="Google Gemini",
+        kind=ProviderKind.OPENAI_COMPATIBLE,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        model="gemini-2.0-flash",
+        api_key_required=True,
+        fallback_models=("gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"),
+    ),
+    ProviderPreset(
+        id="grok",
+        label="xAI Grok",
+        kind=ProviderKind.OPENAI_COMPATIBLE,
+        base_url="https://api.x.ai/v1",
+        model="grok-3",
+        api_key_required=True,
+        fallback_models=("grok-4", "grok-3", "grok-3-mini"),
+    ),
+    ProviderPreset(
+        id="deepseek",
+        label="DeepSeek",
+        kind=ProviderKind.OPENAI_COMPATIBLE,
+        base_url="https://api.deepseek.com/v1",
+        model="deepseek-chat",
+        api_key_required=True,
+        fallback_models=("deepseek-chat", "deepseek-reasoner"),
+    ),
+    ProviderPreset(
+        id="vercel",
+        label="Vercel AI Gateway",
+        kind=ProviderKind.OPENAI_COMPATIBLE,
+        base_url="https://ai-gateway.vercel.sh/v1",
+        # The gateway names models ``provider/model``, which is what the picker lists for it.
+        model="openai/gpt-4o",
+        api_key_required=True,
+        fallback_models=(
+            "openai/gpt-4o",
+            "anthropic/claude-sonnet-4",
+            "google/gemini-2.0-flash",
+        ),
+    ),
+    # The two local runtimes are separate presets rather than one, because the *port* is the
+    # whole difference and the wrong one is a connection refused: Ollama answers on 11434, LM
+    # Studio on 1234, and a user who picked "local model" had a 50% chance of starting from an
+    # endpoint nothing was listening on. Both keep the ``local`` kind, which is what decides the
+    # loopback allowance and the "no key needed" rule — the id is only a label for the picker.
+    ProviderPreset(
+        id="ollama",
+        label="Ollama",
+        kind=ProviderKind.LOCAL,
+        base_url="http://127.0.0.1:11434/v1",
+        # A published Ollama model, not a guess about the user's machine: Ollama pulls on demand,
+        # so `ollama run llama3.1` makes this true, and it is editable either way. Ollama serves
+        # `/v1/models` (since 0.1.24), so connect replaces this list with what is actually pulled.
+        model="llama3.1",
+        api_key_required=False,
+    ),
+    ProviderPreset(
+        id="lmstudio",
+        label="LM Studio",
+        kind=ProviderKind.LOCAL,
+        base_url="http://127.0.0.1:1234/v1",
+        # LM Studio has no pull-on-demand and no catalogue: only what the user downloaded exists,
+        # under the repo-style ids it shows in its own UI. This is the starting value, and the
+        # connect step lists what this machine actually has loaded.
+        model="google/gemma-4-e4b",
+        api_key_required=False,
+    ),
+)
+
+
+#: How much of a stored key may be shown back, and how long a key must be before showing that much
+#: says anything: four characters identify a key in a list, while four characters of a short value
+#: are most of the value.
+API_KEY_HINT_LENGTH = 4
+API_KEY_HINT_MIN_LENGTH = 12
+
+
+class ProviderProfile(APIModel):
+    """One configured endpoint, as it is stored.
+
+    The stored shape and the wire shape are deliberately two models. This one holds ``api_key``,
+    and :class:`ProviderProfileInfo` — the only shape any handler returns — has no field a key
+    could travel in, so a response that leaks one is not something a serialiser setting can cause.
+    """
+
+    id: str
+    label: str
+    kind: ProviderKind
+    base_url: str
+    #: The model a run uses unless the caller names another one.
+    model: str
+    #: What this endpoint last said it serves, or the curated seed when it would not say. Stored
+    #: rather than probed per request, so the dropdown opens without a network call and a provider
+    #: that is temporarily down does not empty the list it already answered.
+    models: list[str] = Field(default_factory=list)
+    #: When :attr:`models` was stored, in epoch seconds — ``None`` when nothing has been connected.
+    models_fetched_at: int | None = None
+    #: Which of the two sources :attr:`models` came from, or ``None`` before the first connect.
+    models_source: ModelSource | None = None
+    #: The profile's credential. It lives in the profile file, which is restricted to the account
+    #: that wrote it, and nowhere else — not in ``.env``, not in a log line, not in a response.
+    api_key: str | None = None
+    active: bool = False
+    created_at: int
+
+    def info(self) -> ProviderProfileInfo:
+        """The wire view: the key reduced to whether there is one, and its last few characters."""
+        key = (self.api_key or "").strip()
+        return ProviderProfileInfo(
+            id=self.id,
+            label=self.label,
+            kind=self.kind,
+            base_url=self.base_url,
+            model=self.model,
+            models=list(self.models),
+            models_fetched_at=self.models_fetched_at,
+            models_source=self.models_source,
+            api_key_set=bool(key),
+            api_key_hint=(
+                key[-API_KEY_HINT_LENGTH:] if len(key) >= API_KEY_HINT_MIN_LENGTH else None
+            ),
+            active=self.active,
+            created_at=self.created_at,
+        )
+
+
+class ProviderProfileInfo(APIModel):
+    """A stored profile as the API returns it — never the key itself."""
+
+    id: str
+    label: str
+    kind: ProviderKind
+    base_url: str
+    model: str
+    #: The endpoint's own models when it listed them, the curated seed when it would not, and
+    #: empty until the connect step has run. ``modelsSource`` says which of the two it is, and
+    #: ``None`` when nothing has been fetched — an empty list and an unfetched one are different
+    #: answers, and the UI has to be able to tell them apart.
+    models: list[str] = Field(default_factory=list)
+    models_fetched_at: int | None = None
+    models_source: ModelSource | None = None
+    api_key_set: bool
+    #: The last four characters, enough to tell two keys apart in a list; ``None`` when there is
+    #: no key or the key is too short for its tail to be anything but the key.
+    api_key_hint: str | None
+    active: bool
+    created_at: int
+
+
+class ProvidersResponse(APIModel):
+    """The whole list, which is what every profile mutation returns: the client then redraws it
+    from one shape instead of reconciling four."""
+
+    profiles: list[ProviderProfileInfo]
+    #: The profile a run talks to, or ``None`` when the user has configured none.
+    active_id: str | None = None
+    #: Something the user has to know about a mutation that nevertheless succeeded — today, that a
+    #: profile holding a key now points at a different host. ``None`` when there is nothing to say.
+    notice: str | None = None
+
+
+class CreateProviderRequest(APIModel):
+    """``kind`` arrives as text so an unknown one is a refusal naming the accepted values rather
+    than a 422 from the enum's own parser (the same reason ``branchStrategy`` is a string)."""
+
+    label: str
+    kind: str
+    base_url: str
+    model: str
+    api_key: str | None = None
+
+
+class UpdateProviderRequest(APIModel):
+    """Partial edit. ``None`` leaves a field as it was; an empty ``api_key`` clears it."""
+
+    label: str | None = None
+    base_url: str | None = None
+    model: str | None = None
+    api_key: str | None = None
+
+
+class ProviderTestResponse(APIModel):
+    """The outcome of one authenticated call to a profile's endpoint.
+
+    A refused key is an answer, not an error: the endpoint's own words come back here and the
+    request still succeeds.
+    """
+
+    ok: bool
+    detail: str
+    models: list[str] = Field(default_factory=list)
+
+
+class ProviderConnectResponse(APIModel):
+    """The outcome of the connect step: ask the endpoint what it serves, and store the answer.
+
+    ``ok`` false travels with HTTP 200, because it is one of the answers the user asked for — a
+    refused key, or a provider that will not list its models *and* has no curated seed to offer.
+    ``source`` is never absent: whichever list comes back, this says whether the provider or the
+    preset produced it, and a preset with nothing curated still reports ``"preset"`` so the UI can
+    say where the empty dropdown came from.
+    """
+
+    ok: bool
+    detail: str
+    models: list[str] = Field(default_factory=list)
+    source: ModelSource
+
+
+class ProviderModelsResponse(APIModel):
+    """What a profile has stored: the list, where it came from, and when.
+
+    Read from the store with no network call, because this is what a dropdown opens on — a
+    provider that is slow, rate-limiting or off must not be able to delay a picker that already
+    has an answer from the last connect.
+    """
+
+    models: list[str] = Field(default_factory=list)
+    source: ModelSource | None = None
+    fetched_at: int | None = None
+
+
+class ProviderPresetsResponse(APIModel):
+    """The providers a profile can be created from. The client renders this list as it arrives."""
+
+    presets: list[ProviderPreset]
+
+
 class ModelInfo(APIModel):
     id: str
     owned_by: str | None = None
@@ -626,6 +991,10 @@ class RunAgentRequest(APIModel):
     auto_advance: bool = False
     #: Overrides ORBITAL_LLM_MODEL for this run only.
     model: str | None = None
+    #: Pin this run to one provider profile instead of the active one: its base URL, its key and
+    #: its model. ``None`` means the active profile, as every run did before profiles could be
+    #: named here. The active badge does not move — this is a run's choice, not a settings edit.
+    provider_id: str | None = None
     #: Workspace-relative paths whose contents are added to the phase brief.
     attachments: list[str] | None = None
     reasoning_effort: str | None = None
@@ -643,6 +1012,8 @@ class ChatTurnRequest(APIModel):
     message: str
     project_path: str
     model: str | None = None
+    #: Pin this turn to one provider profile; see :class:`RunAgentRequest`.
+    provider_id: str | None = None
     #: Workspace-relative paths the user attached. A chat turn can carry an image, because its
     #: message is multimodal; a run cannot (see ``services.attachments.build_run_context``).
     attachments: list[str] | None = None
@@ -706,6 +1077,107 @@ class RunAccepted(APIModel):
     status: RunStatus
 
 
+# --------------------------------------------------------------------------------------
+# Chats and skills — the conversations the sidebar lists, and the instructions a composer
+# can turn into a prompt.
+#
+# A chat id *is* a runtime session id: one id addresses both, so the sidebar entry and the
+# state a run updates can never be two different conversations.
+# --------------------------------------------------------------------------------------
+
+#: What a chat is called until its first user message names it. The same literal the client
+#: starts its own placeholder with, so a chat created offline and one created here agree.
+NEW_CHAT_TITLE = "New chat"
+
+#: How much of the first message becomes the title: enough to recognise the conversation in the
+#: sidebar, short enough that the row does not have to be truncated to render it.
+CHAT_TITLE_LIMIT = 60
+
+
+class Chat(APIModel):
+    """One conversation, as the sidebar lists it and as the socket addresses it.
+
+    ``renamed`` never reaches the wire — it is the flag that decides whether a later message may
+    still name the chat, and the client has nothing to do with it.
+    """
+
+    id: str
+    title: str = NEW_CHAT_TITLE
+    workspace: str | None = None
+    phase: Phase = Phase.PLAN
+    provider_id: str | None = None
+    model: str | None = None
+    created_at: int = 0
+    updated_at: int = 0
+    message_count: int = 0
+    run_status: RunStatus = RunStatus.IDLE
+    #: True once the user has named the chat, by creating it with a title or by renaming it.
+    renamed: bool = Field(default=False, exclude=True)
+
+
+class ChatsResponse(APIModel):
+    """Every chat, newest activity first — which is what every mutation returns."""
+
+    chats: list[Chat]
+
+
+class ChatResponse(APIModel):
+    chat: Chat
+
+
+class ChatStateResponse(APIModel):
+    """A chat and the live session state behind it: what the composer refreshes a chat with."""
+
+    chat: Chat
+    state: SessionState
+
+
+class CreateChatRequest(APIModel):
+    """``workspace`` and ``phase`` are optional, so a chat can be started from anywhere."""
+
+    title: str | None = None
+    workspace: str | None = None
+    phase: Phase | None = None
+
+
+class UpdateChatRequest(APIModel):
+    """Partial edit of a chat. ``None`` leaves that field alone."""
+
+    title: str | None = None
+    phase: Phase | None = None
+    provider_id: str | None = None
+    model: str | None = None
+
+
+#: Where a skill was found: the open workspace's own folder, or the user's across every project.
+SkillSource = Literal["workspace", "user"]
+
+
+class Skill(APIModel):
+    """One markdown instruction file, as the composer lists it.
+
+    ``path`` is absolute and the app never writes it: a skill is a file the user owns and the
+    backend is only ever a reader of.
+    """
+
+    id: str
+    name: str
+    description: str
+    source: SkillSource
+    path: str
+
+
+class SkillsResponse(APIModel):
+    skills: list[Skill]
+
+
+class SkillResponse(APIModel):
+    """One skill and its markdown body — the prompt the composer inserts."""
+
+    skill: Skill
+    body: str
+
+
 class ConfigResponse(APIModel):
     model: str
     base_url: str
@@ -718,10 +1190,13 @@ class ConfigResponse(APIModel):
 
 
 class ConfigUpdateRequest(APIModel):
-    """Partial settings update. Omitted fields are untouched; an empty ``api_key`` clears it."""
+    """Partial settings update. Omitted fields are untouched."""
 
     model: str | None = None
     base_url: str | None = None
+    #: Refused rather than dropped: the credential belongs to the provider profile that owns the
+    #: endpoint it was issued for, and a client still sending it has to be told so instead of
+    #: believing it saved one here. It is declared for that refusal to be able to name the field.
     api_key: str | None = None
     command_timeout: int | None = None
     max_output_bytes: int | None = None
@@ -810,6 +1285,11 @@ WsEventType = Literal[
     "agent.tool_result",
     "agent.todos",
     "agent.error",
+    #: A side question answered beside a run: start, tokens, end, each carrying the requestId the
+    #: answer belongs to so a client can tell two of them apart. Nothing here advances the run.
+    "agent.answer.start",
+    "agent.answer.token",
+    "agent.answer.end",
     "agent.done",
     "terminal.output",
     "terminal.exit",
@@ -862,8 +1342,16 @@ class ClientFrame(APIModel):
     project_path: str | None = None
     auto_advance: bool = False
     model: str | None = None
+    #: Pin the turn to one provider profile instead of the active one. Carried on ``agent.run``
+    #: and ``agent.chat``, exactly as the REST bodies carry it — the composer's runs go over this
+    #: socket, so a pin that only reached the REST route would not reach the composer at all.
+    provider_id: str | None = None
     message: str | None = None
     request_id: str | None = None
+    #: Carried on ``agent.ask``: the side question, answered without disturbing the run. Read as a
+    #: field rather than off the raw payload because this model ignores unknown keys, so a frame
+    #: whose question arrived only in the JSON would be dropped here and never seen by the server.
+    question: str | None = None
     approved: bool | None = None
     remember: bool = False
     command: str | None = None

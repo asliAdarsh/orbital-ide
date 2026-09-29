@@ -47,7 +47,11 @@ export function isCapabilityId(value: string): value is CapabilityId {
 export type PermissionMode = "ask" | "allow_all";
 
 export type PhaseStatus = "idle" | "queued" | "running" | "done" | "error";
-export type RunStatus = "idle" | "running" | "done" | "error" | "cancelled";
+/**
+ * `paused` is a step boundary, not a mid-token freeze: the run stopped before its next model or
+ * tool step and its state is preserved, so `resume` continues it where `cancelled` would discard it.
+ */
+export type RunStatus = "idle" | "running" | "paused" | "done" | "error" | "cancelled";
 
 /** Static description of a phase, served by `GET /api/phases`. Keep in sync with `PHASE_SPECS` in models.py. */
 export interface PhaseInfo {
@@ -252,6 +256,88 @@ export interface SessionState {
 }
 
 /**
+ * How a chat's last run ended, as the chat list reports it. Not {@link RunStatus}: the list has no
+ * business distinguishing `done` from `error`, and it must be able to say `paused` without claiming
+ * the run is still streaming.
+ */
+export type ChatRunStatus = "idle" | "running" | "paused" | "cancelled";
+
+/**
+ * One saved conversation.
+ *
+ * The chat id *is* the runtime session id: the socket subscribes with it, and every frame names it.
+ * That is what makes a chat resumable — the runtime keys the transcript, the phase statuses and the
+ * usage counters by this id, so a switch both re-subscribes and re-reads the same session.
+ *
+ * `workspace` is the absolute project path the chat belongs to, or null for one started with no
+ * folder open. The chat list's "This workspace" scope is exactly this field.
+ */
+export interface Chat {
+  id: string;
+  title: string;
+  workspace: string | null;
+  phase: Phase;
+  providerId: string | null;
+  model: string | null;
+  createdAt: number;
+  updatedAt: number;
+  messageCount: number;
+  runStatus: ChatRunStatus;
+}
+
+export interface ChatsResponse {
+  chats: Chat[];
+}
+
+export interface ChatResponse {
+  chat: Chat;
+}
+
+/** What "refresh this chat" fetches: the row's metadata and the runtime state behind it. */
+export interface ChatStateResponse {
+  chat: Chat;
+  state: SessionState;
+}
+
+export interface CreateChatRequest {
+  title?: string;
+  workspace?: string;
+  phase?: Phase;
+}
+
+/** A partial edit: every field omitted is left as it was. */
+export interface ChatPatch {
+  title?: string;
+  phase?: Phase;
+  providerId?: string | null;
+  model?: string | null;
+}
+
+/**
+ * One promptable skill, served by `GET /api/skills`.
+ *
+ * A skill is a markdown file the app only ever reads: the composer turns its body into a prompt, and
+ * nothing here writes or executes one.
+ */
+export interface SkillInfo {
+  id: string;
+  name: string;
+  description: string;
+  source: "workspace" | "user";
+  /** Absolute path of the markdown file, for the tooltip. */
+  path: string;
+}
+
+export interface SkillsResponse {
+  skills: SkillInfo[];
+}
+
+export interface SkillResponse {
+  skill: SkillInfo;
+  body: string;
+}
+
+/**
  * Measured by Orbital, not reported by the gateway: token counts from the provider proved
  * unreliable, so these count what was actually sent and received.
  */
@@ -265,18 +351,6 @@ export interface UsageSnapshot {
   /** The window `contextTokens` is measured against; 0 when unknown. */
   contextWindow: number;
   runningMs: number;
-}
-
-export interface ModelInfo {
-  id: string;
-  ownedBy: string | null;
-}
-
-export interface ModelsResponse {
-  models: ModelInfo[];
-  default: string;
-  /** "gateway" when fetched live, "fallback" when the gateway was unreachable. */
-  source: string;
 }
 
 /**
@@ -340,6 +414,9 @@ export type WsEventType =
   | "usage.updated"
   | "agent.command_request"
   | "approval.resolved"
+  | "agent.answer.start"
+  | "agent.answer.token"
+  | "agent.answer.end"
   | "log"
   | "error"
   | "pong";
@@ -365,6 +442,20 @@ export interface ServerPayloads {
   "usage.updated": UsageSnapshot;
   "agent.command_request": CommandRequest;
   "approval.resolved": { requestId: string; approved: boolean; remember: boolean };
+  /**
+   * A side question's answer, streamed separately from the transcript: the question was asked about
+   * the turn in flight, not alongside it, so its answer must never become a chat message. Every
+   * frame carries the `requestId` the client sent with `agent.ask`, which is what lets one answer
+   * be told from another — and from the transcript itself.
+   */
+  "agent.answer.start": { requestId: string };
+  "agent.answer.token": { requestId: string; text: string };
+  /**
+   * The last frame of an answer. `error` is non-null when the question failed or was cancelled,
+   * which is why a failed side question never arrives as `agent.error` — this stream owns it, so
+   * the answer pane reports its own failures and the run's error slot stays about the run.
+   */
+  "agent.answer.end": { requestId: string; content: string; error: string | null };
   log: { level: "debug" | "info" | "warn" | "error"; message: string };
   error: { message: string; detail: string | null };
   pong: { ts: number };
@@ -379,6 +470,13 @@ export type ServerMessage = {
 // ---------------------------------------------------------------------------------
 
 export type ClientMessage =
+  /**
+   * The first frame of every connection: the runtime refuses a socket that does not present its
+   * token within five seconds, and the transport sends this before anything the store asks for.
+   * It is a frame rather than a query parameter because a query string is written to every access
+   * log the socket passes through.
+   */
+  | { type: "auth"; token: string }
   | { type: "ping" }
   | { type: "subscribe"; sessionId: string }
   | {
@@ -391,6 +489,11 @@ export type ClientMessage =
       autoAdvance: boolean;
       /** Overrides the configured model for this run only. */
       model?: string;
+      /**
+       * Pins this run to one provider profile — its endpoint, its key and its model — instead of
+       * the active one. The active profile is not moved: the pin is this run's choice.
+       */
+      providerId?: string;
       /** Workspace-relative paths to fold into the brief; null when nothing is attached. */
       attachments: string[] | null;
       /**
@@ -417,6 +520,8 @@ export type ClientMessage =
       message: string;
       projectPath: string;
       model?: string;
+      /** Pins this turn to one provider profile; see the `agent.run` frame. */
+      providerId?: string;
       /** Workspace-relative paths to fold into the turn; null when nothing is attached. */
       attachments: string[] | null;
       /** Null means the parameter is left off the request entirely. */
@@ -427,6 +532,33 @@ export type ClientMessage =
       permission: PermissionMode | null;
     }
   | { type: "agent.cancel"; sessionId: string }
+  | {
+      /**
+       * Ask the run to stop at its next step boundary. Not a mid-token freeze: the frames already
+       * streaming finish, the state is preserved, and `resume` continues from there.
+       */
+      type: "agent.pause";
+      sessionId: string;
+    }
+  | { type: "agent.resume"; sessionId: string }
+  | {
+      /**
+       * A side question about the turn in flight. Its answer streams back as `agent.answer.*`,
+       * tagged with `requestId`, and is deliberately never appended to the transcript.
+       */
+      type: "agent.ask";
+      sessionId: string;
+      question: string;
+      requestId: string;
+    }
+  | {
+      /**
+       * Stop one side answer. No sessionId: the question is identified by its own id, and it does
+       * not touch the run — cancelling a question is not cancelling the work it asked about.
+       */
+      type: "agent.ask.cancel";
+      requestId: string;
+    }
   | {
       /**
        * The user's decision on a held command. `remember` allows every later command in this run,
@@ -479,8 +611,33 @@ export type ClientMessage =
  * GET    /api/config                       -> ConfigResponse     (never returns the API key)
  * PUT    /api/config                       <- ConfigUpdate       -> ConfigUpdateResponse
  * GET    /api/files/search?q=&limit=       -> SearchResponse
- * GET    /api/models                       -> ModelsResponse     (live from the gateway)
  * POST   /api/system/pick-folder           <- { title?, initialDir? } -> PickFolderResponse
+ *
+ * Chats. The chat id is the runtime session id, so a chat re-reads the run it belongs to:
+ * GET    /api/chats?workspace=&all=        -> ChatsResponse        (newest first)
+ * POST   /api/chats                        <- CreateChatRequest    -> ChatResponse
+ * GET    /api/chats/{id}                   -> ChatStateResponse
+ * PATCH  /api/chats/{id}                   <- ChatPatch            -> ChatResponse
+ * DELETE /api/chats/{id}                   -> ChatsResponse
+ * POST   /api/chats/{id}/clear             -> ChatStateResponse    (empties the transcript)
+ *
+ * Skills, read-only markdown prompts. A workspace skill id is unique only within its workspace, so
+ * both routes take the workspace to read (`?workspace=`, defaulting to the open project):
+ * GET    /api/skills?workspace=             -> SkillsResponse
+ * GET    /api/skills/{id}?workspace=        -> SkillResponse
+ *
+ * Provider profiles, which decide what a run talks to. The client reads the model list off the
+ * profile (`connect` stores it) rather than from `/api/models`, so the two always describe the
+ * same endpoint:
+ * GET    /api/providers                    -> ProvidersResponse
+ * GET    /api/providers/presets            -> ProviderPresetsResponse
+ * POST   /api/providers                    <- CreateProviderRequest -> ProvidersResponse
+ * PATCH  /api/providers/{id}               <- UpdateProviderRequest -> ProvidersResponse
+ * DELETE /api/providers/{id}               -> ProvidersResponse
+ * POST   /api/providers/{id}/activate      -> ProvidersResponse
+ * POST   /api/providers/{id}/connect       -> ProviderConnectResponse   (always HTTP 200)
+ * GET    /api/providers/{id}/models        -> ProviderModelsResponse    (stored, no network)
+ * POST   /api/providers/{id}/test          -> ProviderTestResponse
  */
 
 export interface HealthResponse {

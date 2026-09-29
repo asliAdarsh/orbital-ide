@@ -9,7 +9,7 @@ from fastapi import APIRouter
 from orbital_backend import config
 from orbital_backend.agents.llm import credential_status, fetch_models, note_credential
 from orbital_backend.config import env_file_path
-from orbital_backend.errors import CommandError, logger
+from orbital_backend.errors import CommandError, ToolError, logger
 from orbital_backend.models import (
     CAPABILITIES,
     PHASE_SPECS,
@@ -67,11 +67,12 @@ async def read_config() -> ConfigResponse:
 
 #: Settings the settings page may change: request field → (settings attribute, environment key).
 #: The names genuinely differ — the wire calls it ``model``, pydantic calls it ``llm_model`` — and
-#: conflating them silently set the wrong attribute.
+#: conflating them silently set the wrong attribute. ``apiKey`` is deliberately not here: a
+#: credential has one home, the provider profile it was entered for, and this endpoint refuses it
+#: rather than writing into the file the profile store replaced.
 _SETTING_FIELDS: dict[str, tuple[str, str]] = {
     "model": ("llm_model", "ORBITAL_LLM_MODEL"),
     "base_url": ("llm_base_url", "ORBITAL_LLM_BASE_URL"),
-    "api_key": ("llm_api_key", "ORBITAL_LLM_API_KEY"),
     "command_timeout": ("command_timeout", "ORBITAL_COMMAND_TIMEOUT"),
     "max_output_bytes": ("max_output_bytes", "ORBITAL_MAX_OUTPUT_BYTES"),
     "context_window": ("context_window", "ORBITAL_CONTEXT_WINDOW"),
@@ -100,7 +101,18 @@ async def update_config(body: ConfigUpdateRequest) -> ConfigUpdateResponse:
 
     Values are written to ``backend/.env`` and set on the live settings object, so everything
     except the bind address takes effect on the next run without a restart.
+
+    An ``apiKey`` here is refused rather than written: the credential belongs to the provider
+    profile it was entered for, and a client that still sends one has to be told that rather than
+    left believing it was saved. ``ORBITAL_LLM_API_KEY`` remains the fallback for a machine with
+    no profiles, and is edited in ``.env`` — not through this endpoint.
     """
+    if body.api_key is not None:
+        raise ToolError(
+            "the API key belongs to a provider profile, not to the settings file: add or edit it "
+            "under Providers (POST/PATCH /api/providers). PUT /api/config no longer accepts "
+            "'apiKey'."
+        )
     settings = config.settings
     updates: dict[str, object] = {}
     env_writes: dict[str, str] = {}
@@ -124,9 +136,9 @@ async def update_config(body: ConfigUpdateRequest) -> ConfigUpdateResponse:
             raise CommandError(f"could not write backend/.env: {exc}") from exc
         for attribute, value in updates.items():
             setattr(settings, attribute, value)
-        if {"llm_api_key", "llm_base_url"} & set(updates):
-            # The refusal was about the credential that was just replaced; keeping it would
-            # refuse the next run for a mistake the user has already fixed.
+        if "llm_base_url" in updates:
+            # The refusal was about the endpoint that was just replaced; keeping it would refuse
+            # the next run for a mistake the user has already fixed.
             note_credential("unknown")
         _log.info(
             "settings updated: %s (env keys written: %s)",

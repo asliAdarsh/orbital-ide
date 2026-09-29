@@ -7,6 +7,11 @@ export interface ConfirmButtonProps {
   onConfirm: () => void;
   children: ReactNode;
   confirmLabel?: string;
+  /**
+   * Accessible name and tooltip. The armed label replaces the children, so a button whose whole
+   * content is an icon has no name at all without this.
+   */
+  label?: string;
   variant?: ButtonProps["variant"];
   size?: ButtonProps["size"];
   className?: string;
@@ -17,6 +22,7 @@ export function ConfirmButton({
   onConfirm,
   children,
   confirmLabel = "Confirm?",
+  label,
   variant = "secondary",
   size = "xs",
   className,
@@ -60,6 +66,8 @@ export function ConfirmButton({
       size={size}
       className={className}
       disabled={disabled}
+      aria-label={label}
+      title={label}
       onClick={handleClick}
     >
       {armed ? confirmLabel : children}

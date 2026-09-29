@@ -1,22 +1,21 @@
 """HTTP contract checks against the real ASGI app.
 
-``ASGITransport`` exercises the routers and error handlers without binding a port and
-without running the lifespan (which would print the sidecar ready line).
+The ``client`` fixture (``conftest.py``) drives the app through ``ASGITransport``: the routers and
+error handlers run for real, without binding a port and without running the lifespan (which would
+print the sidecar ready line). It authenticates the way the host does, because every ``/api`` route
+refuses an unauthenticated caller.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
 import pytest
-import pytest_asyncio
 from starlette.websockets import WebSocketDisconnect
 
 from orbital_backend.config import settings
-from orbital_backend.main import create_app
 
 pytestmark = pytest.mark.asyncio
 
@@ -42,13 +41,6 @@ CONFIG_FIELDS = {
     "contextWindow",
     "maxTokens",
 }
-
-
-@pytest_asyncio.fixture()
-async def client() -> AsyncIterator[httpx.AsyncClient]:
-    transport = httpx.ASGITransport(app=create_app())
-    async with httpx.AsyncClient(transport=transport, base_url="http://orbital.test") as http:
-        yield http
 
 
 async def test_health_payload_matches_the_wire_contract(client: httpx.AsyncClient) -> None:
@@ -192,25 +184,6 @@ async def test_settings_update_with_no_changes_writes_nothing(
     assert not env_file.exists(), "an empty update must not create or rewrite the file"
 
 
-async def test_settings_update_clears_the_key_when_asked(
-    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An empty apiKey is the explicit sign-out, and must not be reported as a leak."""
-    from orbital_backend.routes import system as system_routes
-
-    env_file = tmp_path / ".env"
-    env_file.write_text("ORBITAL_LLM_API_KEY=sk-something\n", encoding="utf-8")
-    monkeypatch.setattr(system_routes, "env_file_path", lambda: env_file)
-    monkeypatch.setattr(settings, "llm_api_key", "sk-something")
-
-    body = (await client.put("/api/config", json={"apiKey": ""})).json()
-
-    assert body["changed"] == ["api_key"]
-    assert body["config"]["apiKeyConfigured"] is False
-    assert "sk-something" not in env_file.read_text(encoding="utf-8")
-    assert "sk-something" not in json.dumps(body), "the key must never come back"
-
-
 async def test_search_finds_a_planted_line(
     client: httpx.AsyncClient, tmp_path: Path
 ) -> None:
@@ -305,28 +278,30 @@ async def test_session_state_serialises_phases_as_string_keys(
     }
 
 
-async def test_replacing_the_key_retires_the_verdict_about_the_old_one(
+async def test_replacing_the_endpoint_retires_the_verdict_about_the_old_one(
     client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A key the user has just replaced must not be refused by a verdict on the previous one."""
-    from orbital_backend.agents import llm as llm_module
-    from orbital_backend.routes import system as system_routes
+    """A credential the user has just re-pointed must not be refused by a verdict on the old one.
 
-    monkeypatch.setattr(system_routes, "write_env_values", lambda *_args, **_kwargs: ["ORBITAL_LLM_API_KEY"])
+    The key itself no longer travels through this endpoint — it belongs to the provider profile that
+    owns its host — so the endpoint is what a settings edit can change.
+    """
+    from orbital_backend.agents import llm as llm_module
+
     monkeypatch.setattr(llm_module, "_credential_state", "rejected", raising=False)
     monkeypatch.setattr(llm_module, "_credential_detail", "HTTP 401 — Invalid API key.", raising=False)
 
-    original = settings.llm_api_key
+    original = settings.llm_base_url
     try:
-        response = await client.put("/api/config", json={"apiKey": "sk-replaced-not-real"})
+        response = await client.put("/api/config", json={"baseUrl": "https://elsewhere.example/v1"})
 
         assert response.status_code == 200
         # `changed` reports setting names, which this codebase keeps in their python spelling.
-        assert response.json()["changed"] == ["api_key"]
+        assert response.json()["changed"] == ["base_url"]
         assert llm_module.credential_status() == ("unknown", None)
     finally:
         # The route assigns onto the live settings object, which monkeypatch cannot intercept.
-        settings.llm_api_key = original
+        settings.llm_base_url = original
 
 
 # -------------------------------------------------------------------------------------
@@ -387,6 +362,9 @@ class ScriptedSocket:
     def __init__(self, *frames: dict[str, object]) -> None:
         self._inbound = [json.dumps(frame) for frame in frames]
         self.sent: list[dict[str, object]] = []
+        # The handshake is allowed without an Origin — that is a non-browser local client — and the
+        # endpoint reads it before accepting.
+        self.headers: dict[str, str] = {}
 
     async def accept(self) -> None:
         return None
@@ -401,7 +379,7 @@ class ScriptedSocket:
 
 
 async def test_the_socket_validates_both_new_fields(
-    tmp_path: Path,
+    tmp_path: Path, auth_token: str
 ) -> None:
     """A capability the backend does not publish and a permission outside the union are both
     refused with a frame the client can read, rather than quietly ignored."""
@@ -410,6 +388,8 @@ async def test_the_socket_validates_both_new_fields(
     project = tmp_path / "project"
     project.mkdir()
     socket = ScriptedSocket(
+        # Every connection authenticates first; the transport sends this before anything else.
+        {"type": "auth", "token": auth_token},
         {
             "type": "agent.run",
             "sessionId": "ws-capabilities",
@@ -435,6 +415,51 @@ async def test_the_socket_validates_both_new_fields(
     assert "teleport" in socket.sent[0]["payload"]["message"]
     assert socket.sent[1]["payload"]["message"] == "invalid frame"
     assert "permission" in socket.sent[1]["payload"]["detail"]
+
+
+async def test_the_socket_carries_the_provider_pin(
+    tmp_path: Path, auth_token: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The composer's runs go over this socket, so the pin has to travel on the frame: a provider
+    named only in the REST body would never reach a composer run. A frame naming a profile that
+    does not exist is refused with a frame the client can read, exactly as the route answers 400
+    — and neither the run nor the chat is started."""
+    from orbital_backend import ws as ws_module
+    from orbital_backend.ws import websocket_endpoint
+
+    project = tmp_path / "project"
+    project.mkdir()
+    socket = ScriptedSocket(
+        {"type": "auth", "token": auth_token},
+        {
+            "type": "agent.run",
+            "sessionId": "ws-pin",
+            "phase": "build",
+            "prompt": "build it",
+            "projectPath": str(project),
+            "providerId": "profile-1",
+        },
+        {
+            "type": "agent.chat",
+            "sessionId": "ws-pin",
+            "phase": "plan",
+            "message": "hello",
+            "projectPath": str(project),
+            "providerId": "no-such-profile",
+        },
+    )
+    handed: list[dict[str, object]] = []
+
+    async def run_phase(*args: object, **kwargs: object) -> None:
+        handed.append(kwargs)
+
+    monkeypatch.setattr(ws_module, "run_phase", run_phase)
+
+    await websocket_endpoint(socket)
+
+    assert handed[0]["provider_id"] == "profile-1"
+    assert [frame["type"] for frame in socket.sent] == ["error"]
+    assert "no-such-profile" in socket.sent[0]["payload"]["message"]
 
 
 async def test_each_session_gets_its_own_frame_sequence() -> None:

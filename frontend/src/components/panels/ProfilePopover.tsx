@@ -1,92 +1,49 @@
-import { useEffect, useState } from "react";
-import { CircleUser } from "lucide-react";
-
-import { api, errorMessage } from "@/lib/api";
-import type { ConfigResponse } from "@/types/protocol";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { ConfirmButton } from "@/components/common/ConfirmButton";
-import { StatusDot } from "@/components/common/StatusDot";
-import { toast } from "@/components/common/Toaster";
-
-/** Host and port of the configured endpoint, or the raw value when it is not a URL. */
-function endpointHost(baseUrl: string): string {
-  try {
-    return new URL(baseUrl).host;
-  } catch {
-    return baseUrl;
-  }
-}
-
 /**
- * The model-provider credential, not an app account: Orbital stores exactly one API key
- * for the configured gateway, and this control is where it is set, checked and cleared.
- */
-/**
+ * The account row and the provider the runtime runs on.
+ *
+ * Two unrelated things share one popover because to the person using it they answer the same
+ * question — "who am I, in here": the Orbital account the app is gated on, and the model provider
+ * the runtime holds. The provider is only *read* here, and changed in settings: a second place to
+ * paste a key is a second place to paste the wrong one.
+ *
  * ``label`` turns the trigger into a labelled row, for the places that present it in a list of
  * buttons rather than in a strip of icons.
  */
+
+import { useEffect, useState } from "react";
+import { CircleUser } from "lucide-react";
+
+import { useAuth } from "@/hooks/useAuth";
+import { useProviders } from "@/hooks/useProviders";
+import { endpointHost } from "@/lib/providers";
+import { useAppStore } from "@/store/app-store";
+import { Button } from "@/components/ui/button";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { StatusDot } from "@/components/common/StatusDot";
+
 export function ProfilePopover({ label }: { label?: string } = {}) {
+  const { user, signOut: endAccountSession, busy: endingAccountSession } = useAuth();
+  const { status, profiles, activeId, error, refresh } = useProviders();
+  const setSettingsOpen = useAppStore((state) => state.setSettingsOpen);
   const [open, setOpen] = useState(false);
-  const [config, setConfig] = useState<ConfigResponse | null>(null);
-  const [apiKey, setApiKey] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
 
-  // Read the credential state fresh on every open: it can change from the settings page
-  // or a backend restart, and the key itself is never fetched.
+  // Read the provider fresh on every open: it changes in the settings dialog and in the first-run
+  // screen, and this popover is the only place the account is looked at.
   useEffect(() => {
-    if (!open) return;
-    let cancelled = false;
-    setLoading(true);
-    setApiKey("");
-    void api
-      .config()
-      .then((next) => {
-        if (!cancelled) setConfig(next);
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) toast.error(errorMessage(err));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [open]);
+    if (open) void refresh();
+  }, [open, refresh]);
 
-  const handleSignIn = async () => {
-    const key = apiKey.trim();
-    if (key === "") return;
-    setSubmitting(true);
-    try {
-      await api.updateConfig({ apiKey: key });
-      setConfig(await api.config());
-      setApiKey("");
-      toast.success("Provider key stored.");
-    } catch (err: unknown) {
-      toast.error(errorMessage(err));
-    } finally {
-      setSubmitting(false);
-    }
+  const active = profiles.find((profile) => profile.id === activeId) ?? null;
+  // A keyed provider with no key is the one state that stops every run, and it is not visible in
+  // the label or the endpoint, so the dot says it here.
+  const blocked = active !== null && active.kind !== "local" && !active.apiKeySet;
+
+  // Closing first: settings opens over the workspace, and a popover left open behind it would
+  // reappear on top of the dialog the user is reading.
+  const changeProvider = () => {
+    setOpen(false);
+    setSettingsOpen(true);
   };
-
-  const handleSignOut = async () => {
-    setSubmitting(true);
-    try {
-      await api.updateConfig({ apiKey: "" });
-      setConfig(await api.config());
-      toast.success("Signed out — the stored provider key was cleared.");
-    } catch (err: unknown) {
-      toast.error(errorMessage(err));
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const signedIn = config?.apiKeyConfigured ?? false;
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -105,70 +62,68 @@ export function ProfilePopover({ label }: { label?: string } = {}) {
             variant="ghost"
             size="icon"
             className="rounded-full"
-            aria-label="Model provider credential"
+            aria-label="Account and model provider"
           >
             <CircleUser className="h-4 w-4" />
           </Button>
         )}
       </PopoverTrigger>
       <PopoverContent className="flex w-64 flex-col gap-2 text-2xs">
-        {loading ? (
-          <p className="text-2xs text-muted-foreground">Checking credentials…</p>
-        ) : config === null ? (
-          <p className="text-2xs text-phase-test">
-            Could not read the credential state from the backend. Close and reopen to retry.
-          </p>
-        ) : signedIn ? (
-          <>
-            <div className="flex items-center gap-1.5">
-              <StatusDot state="online" />
-              <span className="text-2xs text-foreground">Provider key stored</span>
-            </div>
-            <div className="flex flex-col gap-0.5 font-mono text-2xs text-muted-foreground">
-              <span className="truncate">{endpointHost(config.baseUrl)}</span>
-              <span className="truncate">{config.model || "gateway default"}</span>
-            </div>
-            <p className="text-2xs leading-relaxed text-muted-foreground">
-              The model-provider credential held by the Orbital runtime — there is no Orbital app account.
-            </p>
-            <ConfirmButton
+        {user === null ? null : (
+          // First, because it is the thing the app is gated on: the provider below belongs to the
+          // runtime, and reading it as the account would be a lie.
+          <div className="flex flex-col gap-1.5 border-b border-border pb-2">
+            <span className="text-2xs text-muted-foreground">Orbital account</span>
+            <span className="truncate font-mono text-2xs text-foreground">{user.email ?? user.uid}</span>
+            <Button
+              size="xs"
+              variant="secondary"
               className="w-full"
-              confirmLabel="Confirm sign out"
-              disabled={submitting}
-              onConfirm={() => void handleSignOut()}
+              loading={endingAccountSession}
+              onClick={() => void endAccountSession()}
             >
               Sign out
-            </ConfirmButton>
+            </Button>
+          </div>
+        )}
+
+        {status === "loading" ? (
+          <p className="text-2xs text-muted-foreground">Checking the provider…</p>
+        ) : status === "error" ? (
+          <p className="font-mono text-2xs leading-relaxed text-phase-test">{error}</p>
+        ) : active === null ? (
+          <>
+            <div className="flex items-center gap-1.5">
+              <StatusDot state="offline" />
+              <span className="text-2xs text-phase-test">No provider configured</span>
+            </div>
+            <p className="text-2xs leading-relaxed text-muted-foreground">
+              Agent runs need a model provider. This is the endpoint the runtime holds, not your Orbital
+              account.
+            </p>
           </>
         ) : (
           <>
             <div className="flex items-center gap-1.5">
-              <StatusDot state="offline" />
-              <span className="text-2xs text-phase-test">No provider key</span>
+              <StatusDot state={blocked ? "offline" : "online"} />
+              <span className={blocked ? "text-2xs text-phase-test" : "text-2xs text-foreground"}>
+                {blocked ? "No key on the active provider" : "Provider configured"}
+              </span>
+            </div>
+            <div className="flex flex-col gap-0.5 font-mono text-2xs text-muted-foreground">
+              <span className="truncate">{active.label}</span>
+              <span className="truncate">{endpointHost(active.baseUrl)}</span>
+              <span className="truncate">{active.model || "provider default"}</span>
             </div>
             <p className="text-2xs leading-relaxed text-muted-foreground">
-              Agents cannot run until a provider key is stored. This is the model-provider credential, not an
-              Orbital account.
+              The model provider the Orbital runtime uses, separate from your Orbital account.
             </p>
-            <Input
-              type="password"
-              autoComplete="off"
-              className="h-7 font-mono text-2xs"
-              placeholder="provider API key"
-              value={apiKey}
-              onChange={(event) => setApiKey(event.target.value)}
-            />
-            <Button
-              size="xs"
-              className="w-full"
-              loading={submitting}
-              disabled={apiKey.trim() === ""}
-              onClick={() => void handleSignIn()}
-            >
-              Sign in
-            </Button>
           </>
         )}
+
+        <Button size="xs" variant="secondary" className="w-full" onClick={changeProvider}>
+          Change provider
+        </Button>
       </PopoverContent>
     </Popover>
   );

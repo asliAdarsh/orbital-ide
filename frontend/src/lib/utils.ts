@@ -32,3 +32,33 @@ export function createId(prefix: string): string {
   }
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
+
+/**
+ * Last path segment of a path, which is the name a chip or row has room for.
+ *
+ * Both separators: workspace paths inside the app are POSIX-separated (`FileNode.path`), but a
+ * chat's workspace is the absolute path the runtime holds, which on Windows is backslashed.
+ */
+export function baseName(path: string): string {
+  const segments = path.split(/[\\/]/);
+  return segments[segments.length - 1] || path;
+}
+
+/** A coarse "how long ago" for list rows: exactness matters less than the order of magnitude. */
+export function formatRelativeAge(stamp: number, now = Date.now()): string {
+  // The runtime is not consistent about the unit — the project registry stores seconds, frames
+  // carry milliseconds — so anything below the millisecond magnitude is read as seconds. A wrong
+  // guess here is only ever a wrong-looking age.
+  const ms = stamp < 1e11 ? stamp * 1000 : stamp;
+  const seconds = Math.max(0, Math.round((now - ms) / 1000));
+  if (seconds < 45) return "just now";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${Math.max(1, minutes)}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  const months = Math.round(days / 30);
+  if (months < 12) return `${months}mo ago`;
+  return `${Math.round(months / 12)}y ago`;
+}

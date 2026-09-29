@@ -76,6 +76,11 @@ class Settings(BaseSettings):
     # https://opencode.ai/zen/go alone would request .../zen/go/chat/completions and 404.
     llm_base_url: str = "https://opencode.ai/zen/go/v1"
     llm_api_key: str = ""
+    #: The shared secret every request and socket has to carry; see
+    #: :mod:`orbital_backend.auth`. The host sets it — ``dev.mjs`` mints one, the Tauri sidecar
+    #: reads the one this process mints when the variable is empty. ``repr=False`` so a traceback
+    #: or a log of the settings object can never print it.
+    auth_token: str = Field(default="", repr=False)
     #: Output ceiling for one specialist turn. Bounds a runaway generation; 0 disables it.
     llm_max_tokens: int = 8000
     #: Context window of the configured model, in tokens. Drives the context gauge; the
@@ -118,8 +123,21 @@ class Settings(BaseSettings):
 
     @property
     def llm_configured(self) -> bool:
-        """True when an API key is present; agents refuse to start without one."""
-        return bool(self.llm_api_key.strip())
+        """True when a run has a credential to start with.
+
+        The active provider profile decides whenever there is one, because the active profile is
+        what :func:`orbital_backend.agents.llm.build_llm` will talk to: a `local` profile needs no
+        key, and any other needs its own. With no profile this is the dotenv key, exactly as it
+        was before profiles existed, so a fresh clone and the health endpoint behave as before.
+
+        The profile store is imported here rather than at module scope because the store reads this
+        module for the state directory: the import runs one way, and this is the single question
+        that has to be answered from both sides — one answer, so the settings page, the health
+        check and the run itself cannot disagree about whether a run can start.
+        """
+        from orbital_backend.services.providers import credential_configured
+
+        return credential_configured()
 
 
 settings = Settings()

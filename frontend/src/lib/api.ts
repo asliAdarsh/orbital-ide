@@ -1,21 +1,26 @@
 /** REST client for the Orbital backend. Every call throws {@link ApiError} on failure. */
 
+import { getAuthToken } from "@/lib/backend";
 import { useAppStore } from "@/store/app-store";
 import type {
   BranchStrategiesResponse,
   BranchStrategyInfo,
   CapabilitiesResponse,
   CapabilityInfo,
+  ChatPatch,
+  ChatResponse,
+  ChatStateResponse,
+  ChatsResponse,
   CommandResult,
   ConfigResponse,
   ConfigUpdate,
   ConfigUpdateResponse,
+  CreateChatRequest,
   DocsResponse,
   FileContent,
   FileNode,
   GitStatus,
   HealthResponse,
-  ModelsResponse,
   PhaseInfo,
   PickFolderResponse,
   ProjectEntry,
@@ -24,6 +29,8 @@ import type {
   ProjectsResponse,
   SearchResponse,
   SessionState,
+  SkillResponse,
+  SkillsResponse,
 } from "@/types/protocol";
 
 /**
@@ -73,9 +80,14 @@ async function readDetail(response: Response): Promise<string | null> {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers);
+  // The runtime refuses a caller without its token; the boot sequence is what supplies one, and
+  // it reports the case where nothing did — see useBackendBoot.
+  const token = getAuthToken();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
   let response: Response;
   try {
-    response = await fetch(apiUrl(path), init);
+    response = await fetch(apiUrl(path), { ...init, headers });
   } catch (cause) {
     throw new ApiError(
       `Cannot reach the Orbital runtime at ${origin()}.`,
@@ -112,8 +124,6 @@ const quote = (value: string) => encodeURIComponent(value);
 export const api = {
   health: () => apiGet<HealthResponse>("/api/health"),
   config: () => apiGet<ConfigResponse>("/api/config"),
-  /** The models the gateway offers. Falls back to a short list when it is unreachable. */
-  models: () => apiGet<ModelsResponse>("/api/models"),
 
   /** Filesystem search for the nav's search bar. */
   search: (query: string, limit = 50) =>
@@ -196,4 +206,37 @@ export const api = {
 
   session: (sessionId: string) => apiGet<SessionState>(`/api/agents/session/${quote(sessionId)}`),
   cancelAgent: (sessionId: string) => apiSend<{ ok: boolean }>("/api/agents/cancel", { sessionId }),
+
+  /**
+   * The saved chats, newest first.
+   *
+   * `workspace` narrows to one folder and `all` widens to every folder, which are the two scopes
+   * the sessions panel offers; passing neither leaves the backend's own default. The two are not
+   * combined here because a caller that means "everything" must not also look filtered.
+   */
+  listChats: async (opts: { workspace?: string | null; all?: boolean } = {}): Promise<ChatsResponse> => {
+    const params = new URLSearchParams();
+    if (opts.all) params.set("all", "true");
+    else if (opts.workspace) params.set("workspace", opts.workspace);
+    const query = params.toString();
+    return apiGet<ChatsResponse>(`/api/chats${query === "" ? "" : `?${query}`}`);
+  },
+  /** The row's metadata plus the runtime state behind it — what "refresh this chat" fetches. */
+  chat: (id: string) => apiGet<ChatStateResponse>(`/api/chats/${quote(id)}`),
+  createChat: (input: CreateChatRequest = {}) => apiSend<ChatResponse>("/api/chats", input),
+  updateChat: (id: string, patch: ChatPatch) =>
+    apiSend<ChatResponse>(`/api/chats/${quote(id)}`, patch, "PATCH"),
+  deleteChat: (id: string) => apiSend<ChatsResponse>(`/api/chats/${quote(id)}`, undefined, "DELETE"),
+  clearChat: (id: string) => apiSend<ChatStateResponse>(`/api/chats/${quote(id)}/clear`),
+
+  /**
+   * The skills a workspace and this machine offer. Read-only: nothing here writes or runs one.
+   *
+   * `workspace` names which workspace's skills are wanted; a workspace skill id is only unique
+   * within its workspace, so a caller whose chat is not the open project must pass it.
+   */
+  skills: async (workspace?: string | null): Promise<SkillsResponse> =>
+    apiGet<SkillsResponse>(`/api/skills${workspace ? `?workspace=${quote(workspace)}` : ""}`),
+  skill: (id: string, workspace?: string | null) =>
+    apiGet<SkillResponse>(`/api/skills/${quote(id)}${workspace ? `?workspace=${quote(workspace)}` : ""}`),
 };

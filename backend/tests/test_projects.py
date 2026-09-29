@@ -11,16 +11,13 @@ import json
 import shutil
 import sys
 import time
-from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
 import pytest
-import pytest_asyncio
 
 from orbital_backend import config
 from orbital_backend.errors import NotFoundError, ToolError, WorkspaceError
-from orbital_backend.main import create_app
 from orbital_backend.services.projects import ProjectRegistry
 from orbital_backend.services.workspace import Workspace
 
@@ -76,13 +73,6 @@ def singleton_workspace(monkeypatch: pytest.MonkeyPatch) -> Workspace:
     monkeypatch.setattr(workspace, "_root", workspace.root)
     monkeypatch.setattr(workspace, "_granted_roots", dict(workspace._granted_roots))
     return workspace
-
-
-@pytest_asyncio.fixture()
-async def client() -> AsyncIterator[httpx.AsyncClient]:
-    transport = httpx.ASGITransport(app=create_app())
-    async with httpx.AsyncClient(transport=transport, base_url="http://orbital.test") as http:
-        yield http
 
 
 async def test_create_makes_the_directory_and_registers_it(

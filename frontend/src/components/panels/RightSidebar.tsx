@@ -7,7 +7,6 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { AgentChat } from "@/components/chat/AgentChat";
 import { AgentRoster } from "@/components/chat/AgentRoster";
-import { ModelPicker } from "@/components/chat/ModelPicker";
 import { ToolInspector } from "@/components/chat/ToolInspector";
 import { toast } from "@/components/common/Toaster";
 
@@ -108,7 +107,6 @@ export function RightSidebar() {
               socket.approve(requestId, approved, remember);
             }}
             className="min-h-0 flex-1"
-            toolbar={<ModelPicker />}
             placeholder={composerPlaceholder}
             disabled={projectPath === null}
             disabledReason="Open a folder to start a run."

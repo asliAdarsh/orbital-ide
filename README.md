@@ -366,16 +366,25 @@ npm run dev             # Vite on http://localhost:5173
 must run with `backend/` as the working directory, and with the interpreter that holds
 fastapi/langgraph, neither of which a bare `python -m orbital_backend` gives you.
 
+It also mints the runtime's **auth token** and hands it to both sides: `ORBITAL_AUTH_TOKEN` for
+the backend, and `VITE_ORBITAL_TOKEN` in `frontend/.env.local` for the dev server — see
+[Security model](#security-model) for why the runtime refuses everything without it. Run
+`backend:dev` first; Vite restarts itself when that file changes, so a dev server already running
+picks the token up.
+
 Then open <http://localhost:5173>: the launcher appears, listing the projects you have already
 made, with a form to create another. Pick one to open the IDE, or create the first with
 **Choose…** for its parent folder plus a name (a description is optional) — the folder is
 `<parent>/<name>`, created if it does not exist yet. See
 [Projects and the launcher](#projects-and-the-launcher).
 
-Sanity check that the runtime came up:
+Sanity check that the runtime came up — every request needs the token, including this one:
 
 ```bash
-curl http://127.0.0.1:8765/api/health
+# The same value is on the backend's ORBITAL_BACKEND_READY line, and in the desktop app it comes
+# from the Tauri host instead.
+TOKEN=$(grep -h '^VITE_ORBITAL_TOKEN=' frontend/.env.local | cut -d= -f2)
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8765/api/health
 # {"status":"ok",...,"llmConfigured":true,...}
 ```
 
@@ -404,6 +413,7 @@ Everything is prefixed `ORBITAL_` and read from the process environment or `.env
 | `ORBITAL_LLM_MAX_TOKENS` | `8000` | output ceiling per specialist turn; `0` disables it |
 | `ORBITAL_CONTEXT_WINDOW` | `128000` | the window the context gauge measures against — the gateway publishes no sizes, so set it to match the model you pick |
 | `ORBITAL_HOST` / `ORBITAL_PORT` | `127.0.0.1` / `8765` | bind address (`0` picks a free port) |
+| `ORBITAL_AUTH_TOKEN` | *(empty)* | the secret every request and socket has to carry. Set by `npm run backend:dev` and read off the readiness line by the Tauri host; set it yourself only to make a bare `python -m orbital_backend` reachable |
 | `ORBITAL_LOG_LEVEL` | `info` | uvicorn/backend log level |
 | `ORBITAL_COMMAND_TIMEOUT` | `600` | seconds before a command's process tree is killed |
 | `ORBITAL_MAX_OUTPUT_BYTES` | `262144` | stdout+stderr captured before truncation |
@@ -558,6 +568,24 @@ The agent runs on the user's machine with the user's privileges, so containment 
   run ends.
 - **Bounded execution.** Per-command timeout and output ceiling; the whole process tree is
   killed on timeout or cancel. A run is capped at a tool-call budget.
+- **The runtime authenticates its host.** Loopback is not a boundary: any page the user has open
+  can reach `127.0.0.1`, and on a shared machine so can every other local account. So every
+  request needs `Authorization: Bearer $ORBITAL_AUTH_TOKEN` and every socket has to present the
+  same token in its first frame within five seconds — the token is a frame rather than a query
+  parameter because a query string is written to every access log. With no token configured the
+  runtime mints one and prints it on its readiness line, which is how the packaged app gets it
+  without baking it into a bundle; a bare `python -m orbital_backend` therefore answers nobody
+  until that token is passed on, and says so once at startup. A refusal never says whether a
+  token was configured.
+- **Sockets check their origin.** A browser does not apply CORS to a WebSocket handshake, so the
+  handshake itself is refused unless its `Origin` is one the app can legitimately have (loopback
+  or the Tauri webview); a missing `Origin` is allowed, because that is a non-browser local
+  client and the token is what gates it.
+- **One home for the credential.** A key lives in `providers.json`, written readable only by the
+  user's account; `PUT /api/config` refuses an `apiKey` outright, and the first start that
+  imports the old `backend/.env` key into a profile blanks it there. A key is also refused for a
+  cloud profile pointed at a loopback, private or link-local address, and a provider's own
+  refusal text is stripped of the key before it is stored, served from `/api/health` or logged.
 - **CORS** is limited to the Tauri webview origins and the Vite dev server.
 
 ## Tests

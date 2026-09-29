@@ -1,0 +1,124 @@
+/**
+ * Firestore security rules.
+ *
+ * The shape they enforce is the account's own data and nothing else: a signed-in user reads their
+ * own `users/{uid}` document, and no one — signed in or not — reads another user's. Everything is
+ * denied by default, so a collection added without a rule here is closed rather than open.
+ *
+ * What a user may *write* is deliberately narrow. Their account document holds the fields that
+ * decide what Orbital spends on their behalf — `plan`, `tokensUsed`, `tokensLimit`, `creditsLimit`,
+ * `creditsUsed`, `creditsResetAt`, `disabled` — and those are written by the gateway with the Admin
+ * SDK, which bypasses these rules by design. A client that could write them could credit itself
+ * prompts it never ran, lift its own suspension or move its own refill date, and a client that
+ * could delete the document would reset itself to the default plan. So the only thing a client may
+ * write is its own display-level fields, on its own document, and only those.
+ *
+ * The `usage` records the gateway appends live in `users/{uid}/usage/{record}`. No rule below
+ * matches them, and the deny-all rule at the end of this file is what keeps them closed — reads
+ * included: the client has no use for an accounting trail.
+ *
+ * The one collection a client does write is its own project records, in
+ * `users/{uid}/projects/{projectId}`: the list of projects a person's account holds and the small
+ * artefacts of each run, which is what lets a second machine see what the first one was working on.
+ * That rule validates every field it accepts, and it accepts no field that could carry a credential
+ * — a provider key stays on the machine it was entered on, and there is no document here for it.
+ *
+ * Provider credentials never appear in a document the client can read: they live behind the
+ * Orbital gateway, so this file does not have to be clever about hiding them.
+ */
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /users/{userId} {
+      function isOwner() {
+        return request.auth != null && request.auth.uid == userId;
+      }
+
+      // The only fields here that describe the person rather than their entitlement. Every other
+      // field in the document — plan, tokensUsed, tokensLimit, creditsLimit, creditsUsed,
+      // creditsResetAt, disabled, updatedAt — is the gateway's to write.
+      function displayFields() {
+        return ['displayName', 'photoURL'];
+      }
+
+      allow read: if isOwner();
+
+      // A client may create its own document only if it holds nothing but display fields: the
+      // moment it writes a field the entitlement reads, it is writing something it does not own.
+      allow create: if isOwner() && request.resource.data.keys().hasOnly(displayFields());
+
+      // An update may touch only display fields — whatever else the caller sends alongside them.
+      allow update: if isOwner()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(displayFields());
+
+      // Deleting the document would reset the account to the default plan, which is the one
+      // escalation the field rules above would otherwise leave open.
+      allow delete: if false;
+    }
+
+    /**
+     * The account's project records: what follows a person between machines.
+     *
+     * One document per project, holding the title, the path, the last phase that machine saw, when
+     * it was written and the run's artefacts. Nothing else about a project is here — no provider
+     * key, no token, no file tree — so this is not a place a credential could be smuggled into
+     * even by a client that wanted to.
+     *
+     * The shape is validated field by field rather than trusted, because the writer is a client:
+     * only the five keys above, every text field a string of a bounded size, `updatedAt` a number
+     * or a timestamp, and each artefact a string at most 64 KB. Three artefacts at that cap come to
+     * 192 KB, well inside Firestore's 1 MB document limit — and a client that is *over* the cap is
+     * refused here rather than writing a document that cannot be stored, which is the failure the
+     * sync reports instead of silently truncating a plan.
+     *
+     * The document id must be the digest of the project's path (see `projectDocumentId` in the
+     * client): one project is one document on every machine, and this collection cannot be used as
+     * general-purpose storage for an account. Deletion is the owner's — a record is a pointer, and
+     * no entitlement is read from it — unlike the account document above.
+     */
+    match /users/{userId}/projects/{projectId} {
+      function isOwner() {
+        return request.auth != null && request.auth.uid == userId;
+      }
+
+      function isPathDigest() {
+        return projectId.matches('^[0-9a-f]{16}$');
+      }
+
+      function isBoundedText(value, limit) {
+        return value is string && value.size() > 0 && value.size() <= limit;
+      }
+
+      /** An artefact that is absent is fine; one that is present must be text of a storable size. */
+      function isBoundedArtefact(name, limit) {
+        return !(name in request.resource.data.artefacts)
+          || (request.resource.data.artefacts[name] is string
+            && request.resource.data.artefacts[name].size() <= limit);
+      }
+
+      function isRecord() {
+        return request.resource.data.keys().hasAll(['title', 'path', 'phase', 'updatedAt', 'artefacts'])
+          && request.resource.data.keys().hasOnly(['title', 'path', 'phase', 'updatedAt', 'artefacts'])
+          && isBoundedText(request.resource.data.title, 256)
+          && isBoundedText(request.resource.data.path, 1024)
+          && request.resource.data.phase is string
+          && request.resource.data.phase.size() <= 32
+          && (request.resource.data.updatedAt is number || request.resource.data.updatedAt is timestamp)
+          && request.resource.data.artefacts is map
+          && request.resource.data.artefacts.keys().hasOnly(['plan', 'agents', 'report'])
+          && isBoundedArtefact('plan', 65536)
+          && isBoundedArtefact('agents', 65536)
+          && isBoundedArtefact('report', 65536);
+      }
+
+      allow read: if isOwner();
+      allow create, update: if isOwner() && isPathDigest() && isRecord();
+      allow delete: if isOwner() && isPathDigest();
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
